@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import signaleyes_mcp
+from signaleyes_mcp import server as signaleyes_mcp
 
 
 @pytest.fixture
