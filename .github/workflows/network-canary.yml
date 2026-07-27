@@ -1,0 +1,21 @@
+name: Network canary
+
+# Hits the real, public api.neo.nl/v1/openapi.json spec (no credentials
+# needed) and checks the generated tool set still looks sane. Kept out of
+# ci.yml so a normal push/PR never depends on an external API's uptime or
+# reachability from GitHub's runners.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - run: uv run pytest -m network -v

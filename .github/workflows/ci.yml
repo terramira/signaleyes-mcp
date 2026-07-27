@@ -5,18 +5,54 @@ on:
     branches: [master]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
       - run: uv run ruff format --check .
       - run: uv run ruff check .
 
-  test:
+  typecheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: uv run pytest --cov=signaleyes_mcp --cov-report=term-missing
+        with:
+          enable-cache: true
+      - run: uv run mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - run: uv run --python ${{ matrix.python-version }} pytest --cov=signaleyes_mcp --cov-report=term-missing --cov-report=html
+      - uses: actions/upload-artifact@v4
+        if: matrix.python-version == '3.11'
+        with:
+          name: coverage-html
+          path: htmlcov/
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - run: uv export --no-hashes --format requirements.txt -o requirements.txt
+      - run: uvx pip-audit -r requirements.txt

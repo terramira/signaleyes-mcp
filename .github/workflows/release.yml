@@ -12,6 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
 
       - name: Verify tag matches pyproject version
         run: |
@@ -24,6 +26,7 @@ jobs:
 
       - run: uv run ruff format --check .
       - run: uv run ruff check .
+      - run: uv run mypy src/
       - run: uv run pytest --cov=signaleyes_mcp --cov-report=term-missing
 
       - name: Create GitHub release

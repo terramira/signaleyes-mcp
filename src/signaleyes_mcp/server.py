@@ -2,10 +2,14 @@
 
 Turns https://api.neo.nl/v1's OpenAPI spec into MCP tools automatically via
 FastMCP.from_openapi — one call per HTTP operation, no hand-written wrappers.
+A few hand-written tools sit on top for things the spec can't express:
+task polling, header-driven pagination, and a credential check.
 """
 
+import asyncio
 import os
 import sys
+from typing import Any
 
 import httpx
 from fastmcp import FastMCP
@@ -30,12 +34,77 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
     route_maps = [RouteMap(pattern=p, mcp_type=MCPType.EXCLUDE) for p in EXCLUDED_PATTERNS]
     route_maps.append(RouteMap(methods=["GET", "POST", "DELETE"], mcp_type=MCPType.TOOL))
 
-    return FastMCP.from_openapi(
+    mcp = FastMCP.from_openapi(
         openapi_spec=spec,
         client=client,
         name="SignalEyes API",
         route_maps=route_maps,
     )
+
+    @mcp.tool
+    async def wait_for_task(
+        task_id: str, timeout: float = 120.0, poll_interval: float = 2.0
+    ) -> dict[str, Any]:
+        """Poll a SignalEyes background task until it finishes, then return its result.
+
+        Many endpoints (concepts, analyses, and source fetches sent with the
+        `Prefer: respond-async` header) return a task_id immediately instead
+        of a result. This collapses the manual GET /task/{id} polling loop
+        into one call instead of many separate tool round-trips.
+        """
+        max_polls = max(1, int(timeout / poll_interval))
+        for _ in range(max_polls):
+            status_resp = await client.get(f"/task/{task_id}")
+            status_resp.raise_for_status()
+            status_body = status_resp.json()
+            status = status_body["status"]
+            if status == "done":
+                result_resp = await client.get(f"/task/{task_id}/result")
+                result_resp.raise_for_status()
+                result: dict[str, Any] = result_resp.json()
+                return result
+            if status == "failed":
+                raise RuntimeError(f"Task {task_id} failed: {status_body.get('error')}")
+            await asyncio.sleep(poll_interval)
+        raise TimeoutError(f"Task {task_id} did not complete within {timeout}s")
+
+    @mcp.tool
+    async def fetch_all_pages(
+        entity: str, polygon: str, variant: str | None = None, max_pages: int = 50
+    ) -> dict[str, Any]:
+        """Fetch every page of a GET /source/{entity} query and merge into one FeatureCollection.
+
+        The API paginates via the X-Total-Pages response header, which the
+        auto-generated per-endpoint tools can't see (they only surface the
+        JSON body) — so fetching a multi-page area otherwise takes one tool
+        call per page, driven by trial and error. This does it in one call.
+        """
+        path = f"/source/{entity}/{variant}" if variant else f"/source/{entity}"
+        features: list[dict[str, Any]] = []
+        page = 1
+        total_pages = 1
+        while page <= min(total_pages, max_pages):
+            resp = await client.get(path, params={"polygon": polygon, "page": page})
+            resp.raise_for_status()
+            total_pages = int(resp.headers.get("X-Total-Pages", 1))
+            features.extend(resp.json().get("features", []))
+            page += 1
+        return {
+            "type": "FeatureCollection",
+            "features": features,
+            "total_pages": total_pages,
+            "pages_fetched": min(total_pages, max_pages),
+        }
+
+    @mcp.tool
+    async def whoami() -> dict[str, Any]:
+        """Check SignalEyes credentials by fetching the caller's active subscriptions."""
+        resp = await client.get("/subscriptions")
+        resp.raise_for_status()
+        body: dict[str, Any] = resp.json()
+        return body
+
+    return mcp
 
 
 def main() -> None:

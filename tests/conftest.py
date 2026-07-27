@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
@@ -67,3 +69,30 @@ def spy_async_client(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", spying_init)
     return captured
+
+
+@pytest.fixture
+def async_client_get_queue(monkeypatch):
+    """Patch httpx.AsyncClient.get to pop pre-queued responses in call order.
+
+    Tests append httpx.Response objects to `.responses` before invoking the
+    tool under test; `.calls` records each (url, params) pair made.
+    """
+    state = SimpleNamespace(responses=[], calls=[])
+
+    async def fake_get(self, url, params=None, **kwargs):
+        state.calls.append({"url": url, "params": params})
+        return state.responses.pop(0)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    return state
+
+
+@pytest.fixture
+def fast_sleep(monkeypatch):
+    """Skip real delays in asyncio.sleep so polling-loop tests run instantly."""
+
+    async def instant_sleep(seconds):
+        return None
+
+    monkeypatch.setattr("signaleyes_mcp.server.asyncio.sleep", instant_sleep)
