@@ -41,7 +41,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv run --python ${{ matrix.python-version }} pytest --cov=signaleyes_mcp --cov-report=term-missing --cov-report=html
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.python-version == '3.11'
         with:
           name: coverage-html
