@@ -47,6 +47,11 @@ Credentials are SignalEyes API credentials (the same username/password used
 with the `/token` endpoints or HTTP Basic auth) — ask NEO for API access if
 you don't have one.
 
+`.env` is loaded automatically (via `python-dotenv`, from the current
+directory or a parent) when running `serve`/`smoke` — no need to `export` it
+into your shell. A real environment variable (e.g. one set in an MCP
+client's own config) always takes precedence over `.env`.
+
 `uv run signaleyes-mcp` takes a subcommand (defaults to `serve` if omitted —
 this is what an MCP client actually launches):
 

@@ -18,6 +18,7 @@ import sys
 from typing import Any
 
 import httpx
+from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.providers.openapi import MCPType, RouteMap
 
@@ -229,6 +230,11 @@ def main(argv: list[str] | None = None) -> None:
 
     if command == "test":
         raise SystemExit(run_tests())
+
+    # Fills in SIGNALEYES_* from a .env file in the cwd (or a parent dir) if
+    # present; real environment variables (e.g. set by an MCP client's own
+    # config) still win, since load_dotenv() never overrides existing ones.
+    load_dotenv()
 
     base_url = os.environ.get("SIGNALEYES_BASE_URL", "https://api.neo.nl/v1")
     username = os.environ.get("SIGNALEYES_USERNAME")

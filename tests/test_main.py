@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,6 +12,9 @@ from signaleyes_mcp import server as signaleyes_mcp
 def clean_env(monkeypatch):
     for var in ("SIGNALEYES_USERNAME", "SIGNALEYES_PASSWORD", "SIGNALEYES_BASE_URL"):
         monkeypatch.delenv(var, raising=False)
+    # Prevent a real .env file on disk (e.g. a dev's local credentials) from
+    # leaking into these tests via main()'s load_dotenv() call.
+    monkeypatch.setattr(signaleyes_mcp, "load_dotenv", lambda *a, **kw: None)
 
 
 # main() takes an explicit argv so tests never fall through to pytest's own
@@ -84,6 +88,62 @@ def test_success_uses_custom_base_url(clean_env, monkeypatch):
 
     fake_build.assert_called_once_with("https://api-dev.neo.nl/v1", "user", "pw")
     fake_server.run.assert_called_once_with()
+
+
+# --- .env loading -------------------------------------------------------
+
+
+def test_serve_calls_load_dotenv_before_checking_credentials(clean_env, monkeypatch):
+    monkeypatch.setenv("SIGNALEYES_USERNAME", "user")
+    monkeypatch.setenv("SIGNALEYES_PASSWORD", "pw")
+
+    fake_load_dotenv = MagicMock()
+    monkeypatch.setattr(signaleyes_mcp, "load_dotenv", fake_load_dotenv)
+    monkeypatch.setattr(signaleyes_mcp, "build_server", MagicMock(return_value=MagicMock()))
+
+    signaleyes_mcp.main([])
+
+    fake_load_dotenv.assert_called_once_with()
+
+
+def test_env_file_fills_in_credentials_missing_from_the_environment(clean_env, monkeypatch):
+    # Regression test: a .env file with credentials must actually reach
+    # os.environ. Simulates load_dotenv() finding one, the way a real .env
+    # file in the project directory would.
+    def fake_load_dotenv(*args, **kwargs):
+        monkeypatch.setenv("SIGNALEYES_USERNAME", "from-dotenv")
+        monkeypatch.setenv("SIGNALEYES_PASSWORD", "from-dotenv-pw")
+
+    monkeypatch.setattr(signaleyes_mcp, "load_dotenv", fake_load_dotenv)
+
+    fake_server = MagicMock()
+    fake_build = MagicMock(return_value=fake_server)
+    monkeypatch.setattr(signaleyes_mcp, "build_server", fake_build)
+
+    signaleyes_mcp.main([])
+
+    fake_build.assert_called_once_with("https://api.neo.nl/v1", "from-dotenv", "from-dotenv-pw")
+
+
+def test_real_environment_variable_takes_precedence_over_dotenv(clean_env, monkeypatch):
+    # load_dotenv()'s default (override=False) means an explicitly-set env
+    # var (e.g. from an MCP client's own config) must win over the .env file.
+    monkeypatch.setenv("SIGNALEYES_USERNAME", "explicit-user")
+    monkeypatch.setenv("SIGNALEYES_PASSWORD", "explicit-pw")
+
+    def fake_load_dotenv(*args, **kwargs):
+        os.environ.setdefault("SIGNALEYES_USERNAME", "from-dotenv")
+        os.environ.setdefault("SIGNALEYES_PASSWORD", "from-dotenv-pw")
+
+    monkeypatch.setattr(signaleyes_mcp, "load_dotenv", fake_load_dotenv)
+
+    fake_server = MagicMock()
+    fake_build = MagicMock(return_value=fake_server)
+    monkeypatch.setattr(signaleyes_mcp, "build_server", fake_build)
+
+    signaleyes_mcp.main([])
+
+    fake_build.assert_called_once_with("https://api.neo.nl/v1", "explicit-user", "explicit-pw")
 
 
 # --- `test` subcommand -------------------------------------------------------
