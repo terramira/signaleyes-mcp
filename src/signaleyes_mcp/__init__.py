@@ -44,8 +44,7 @@ def main() -> None:
     password = os.environ.get("SIGNALEYES_PASSWORD")
     if not username or not password:
         print(
-            "SIGNALEYES_USERNAME and SIGNALEYES_PASSWORD must be set "
-            "(SignalEyes API credentials).",
+            "SIGNALEYES_USERNAME and SIGNALEYES_PASSWORD must be set (SignalEyes API credentials).",
             file=sys.stderr,
         )
         raise SystemExit(1)
@@ -54,5 +53,5 @@ def main() -> None:
     server.run()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

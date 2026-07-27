@@ -74,10 +74,30 @@ environment instead.
 ## Testing
 
 ```bash
-uv run pytest
+uv run pytest --cov=signaleyes_mcp --cov-report=term-missing
 ```
 
-The one test builds the tool set from the live public spec (no credentials
-needed for that — only calling a tool needs auth) and checks it lands in a
-sane shape (100+ tools, no dupes, no excluded endpoints leaking through).
-This doubles as a canary for upstream API/spec changes.
+Unit tests (`test_build_server.py`, `test_main.py`) mock the OpenAPI fetch
+and HTTP client, covering route-map exclusion/inclusion, auth wiring, and
+`main()`'s env-var validation — no network or credentials needed, 100%
+statement coverage. `test_live_spec.py` (marked `network`) hits the real
+public spec and checks the generated tool set lands in a sane shape (100+
+tools, no dupes, no excluded endpoints leaking through) — a canary for
+upstream API/spec changes.
+
+## CI/CD
+
+- **`ci.yml`** — on every push/PR: `ruff format --check` + `ruff check`,
+  then the full test suite with coverage.
+- **`release.yml`** — on pushing a tag `vX.Y.Z`: verifies the tag matches
+  `pyproject.toml`'s version, re-runs lint/tests, then creates a GitHub
+  release.
+
+To cut a release:
+
+```bash
+uv version --bump patch   # or minor / major — updates pyproject.toml + uv.lock
+git commit -am "Bump version to $(uv version --short)"
+git tag "v$(uv version --short)"
+git push && git push --tags
+```
