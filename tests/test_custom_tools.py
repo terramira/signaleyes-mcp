@@ -111,6 +111,54 @@ def test_fetch_all_pages_merges_features_across_pages(
     assert [f["id"] for f in result.structured_content["features"]] == [1, 2, 3]
 
 
+def test_fetch_all_pages_omits_unset_optional_params(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(json={"features": []}, headers={"X-Total-Pages": "1"})
+    )
+
+    _call(server, "fetch_all_pages", {"entity": "building", "polygon": "POLYGON ((0 0))"})
+
+    assert async_client_get_queue.calls[0]["params"] == {"polygon": "POLYGON ((0 0))", "page": 1}
+
+
+def test_fetch_all_pages_passes_through_filters(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(json={"features": []}, headers={"X-Total-Pages": "1"})
+    )
+
+    _call(
+        server,
+        "fetch_all_pages",
+        {
+            "entity": "building",
+            "polygon": "POLYGON ((0 0))",
+            "filter_string": "height=10",
+            "geo_type": "centroid",
+            "simplify": 0.5,
+            "sample": 0.2,
+            "dissolve": False,
+            "intersect_centroid": False,
+        },
+    )
+
+    assert async_client_get_queue.calls[0]["params"] == {
+        "polygon": "POLYGON ((0 0))",
+        "page": 1,
+        "filter_string": "height=10",
+        "geo_type": "centroid",
+        "simplify": 0.5,
+        "sample": 0.2,
+        "dissolve": False,
+        "intersect_centroid": False,
+    }
+
+
 def test_fetch_all_pages_uses_variant_path(mock_spec_get, spy_async_client, async_client_get_queue):
     server = _server(mock_spec_get, spy_async_client)
     async_client_get_queue.responses.append(

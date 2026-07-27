@@ -4,10 +4,16 @@ Turns https://api.neo.nl/v1's OpenAPI spec into MCP tools automatically via
 FastMCP.from_openapi — one call per HTTP operation, no hand-written wrappers.
 A few hand-written tools sit on top for things the spec can't express:
 task polling, header-driven pagination, and a credential check.
+
+`uv run signaleyes-mcp` also supports two non-serving subcommands:
+`test` (runs the test suite) and `smoke` (runs one real query against the
+live API to confirm credentials/connectivity work).
 """
 
+import argparse
 import asyncio
 import os
+import random
 import sys
 from typing import Any
 
@@ -23,13 +29,47 @@ EXCLUDED_PATTERNS = (
     r"^/source/(dsm|dtm)/\{quadkey\}$",
 )
 
+# A small real area (Venlo, NL) known to have buildings/trees/roads, used by
+# `smoke` as a default query when the caller doesn't supply one.
+SMOKE_POLYGON = (
+    "POLYGON ((5.611503 51.644082, 5.611503 51.646226, "
+    "5.61734 51.646226, 5.61734 51.644082, 5.611503 51.644082))"
+)
+SMOKE_ENTITIES = ("building", "tree", "road", "water", "solarpanel")
+
+
+def _make_client(base_url: str, username: str, password: str) -> httpx.AsyncClient:
+    return httpx.AsyncClient(base_url=base_url, auth=httpx.BasicAuth(username, password))
+
+
+def _check_response(resp: httpx.Response) -> None:
+    """Like resp.raise_for_status(), but folds the API's JSON `detail` into the error.
+
+    The API returns structured 4xx/5xx bodies (e.g. 422 validation errors)
+    that raise_for_status() alone discards — surfacing `detail` gives the
+    caller (LLM or human) the actual reason instead of just a status code.
+    """
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = None
+        try:
+            detail = resp.json().get("detail")
+        except ValueError:
+            pass
+        if detail:
+            raise httpx.HTTPStatusError(
+                f"{exc} — {detail}", request=exc.request, response=exc.response
+            ) from exc
+        raise
+
 
 def build_server(base_url: str, username: str, password: str) -> FastMCP:
     resp = httpx.get(f"{base_url}/openapi.json", timeout=30)
     resp.raise_for_status()
     spec = resp.json()
 
-    client = httpx.AsyncClient(base_url=base_url, auth=httpx.BasicAuth(username, password))
+    client = _make_client(base_url, username, password)
 
     route_maps = [RouteMap(pattern=p, mcp_type=MCPType.EXCLUDE) for p in EXCLUDED_PATTERNS]
     route_maps.append(RouteMap(methods=["GET", "POST", "DELETE"], mcp_type=MCPType.TOOL))
@@ -43,7 +83,9 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
 
     @mcp.tool
     async def wait_for_task(
-        task_id: str, timeout: float = 120.0, poll_interval: float = 2.0
+        task_id: str,
+        timeout: float = 120.0,
+        poll_interval: float = 2.0,
     ) -> dict[str, Any]:
         """Poll a SignalEyes background task until it finishes, then return its result.
 
@@ -55,12 +97,12 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         max_polls = max(1, int(timeout / poll_interval))
         for _ in range(max_polls):
             status_resp = await client.get(f"/task/{task_id}")
-            status_resp.raise_for_status()
+            _check_response(status_resp)
             status_body = status_resp.json()
             status = status_body["status"]
             if status == "done":
                 result_resp = await client.get(f"/task/{task_id}/result")
-                result_resp.raise_for_status()
+                _check_response(result_resp)
                 result: dict[str, Any] = result_resp.json()
                 return result
             if status == "failed":
@@ -70,22 +112,44 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
 
     @mcp.tool
     async def fetch_all_pages(
-        entity: str, polygon: str, variant: str | None = None, max_pages: int = 50
+        entity: str,
+        polygon: str,
+        variant: str | None = None,
+        max_pages: int = 50,
+        filter_string: str | None = None,
+        geo_type: str | None = None,
+        simplify: float | None = None,
+        sample: float | None = None,
+        dissolve: bool | None = None,
+        intersect_centroid: bool | None = None,
     ) -> dict[str, Any]:
         """Fetch every page of a GET /source/{entity} query and merge into one FeatureCollection.
 
         The API paginates via the X-Total-Pages response header, which the
         auto-generated per-endpoint tools can't see (they only surface the
         JSON body) — so fetching a multi-page area otherwise takes one tool
-        call per page, driven by trial and error. This does it in one call.
+        call per page, driven by trial and error. This does it in one call,
+        while still supporting the same filters as the single-page tool
+        (filter_string, geo_type, simplify, sample, dissolve,
+        intersect_centroid) so pagination and filtering aren't a trade-off.
         """
         path = f"/source/{entity}/{variant}" if variant else f"/source/{entity}"
+        extra_params: dict[str, Any] = {
+            "filter_string": filter_string,
+            "geo_type": geo_type,
+            "simplify": simplify,
+            "sample": sample,
+            "dissolve": dissolve,
+            "intersect_centroid": intersect_centroid,
+        }
+        extra_params = {k: v for k, v in extra_params.items() if v is not None}
+
         features: list[dict[str, Any]] = []
         page = 1
         total_pages = 1
         while page <= min(total_pages, max_pages):
-            resp = await client.get(path, params={"polygon": polygon, "page": page})
-            resp.raise_for_status()
+            resp = await client.get(path, params={"polygon": polygon, "page": page, **extra_params})
+            _check_response(resp)
             total_pages = int(resp.headers.get("X-Total-Pages", 1))
             features.extend(resp.json().get("features", []))
             page += 1
@@ -100,14 +164,72 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
     async def whoami() -> dict[str, Any]:
         """Check SignalEyes credentials by fetching the caller's active subscriptions."""
         resp = await client.get("/subscriptions")
-        resp.raise_for_status()
+        _check_response(resp)
         body: dict[str, Any] = resp.json()
         return body
 
     return mcp
 
 
-def main() -> None:
+async def run_smoke(
+    base_url: str,
+    username: str,
+    password: str,
+    entity: str | None = None,
+    polygon: str = SMOKE_POLYGON,
+) -> int:
+    """Run one real query against SignalEyes: checks credentials and connectivity end to end.
+
+    Unlike `test`, this hits the live API — useful to sanity-check a
+    deployment's env vars without spinning up an MCP client.
+    """
+    entity = entity or random.choice(SMOKE_ENTITIES)
+    async with _make_client(base_url, username, password) as client:
+        who_resp = await client.get("/subscriptions")
+        _check_response(who_resp)
+        print(f"Credentials OK. Subscriptions: {who_resp.json()}")
+
+        query_resp = await client.get(f"/source/{entity}", params={"polygon": polygon, "page": 1})
+        _check_response(query_resp)
+        data = query_resp.json()
+        total_pages = query_resp.headers.get("X-Total-Pages", "1")
+        print(
+            f"Sample query GET /source/{entity}: "
+            f"{len(data.get('features', []))} feature(s) on page 1 of {total_pages}"
+        )
+    return 0
+
+
+def run_tests() -> int:
+    """Run the test suite via `uv run signaleyes-mcp test` (equivalent to `uv run pytest`)."""
+    import pytest  # local: pytest is a dev-only dependency, not needed to serve
+
+    result: int = pytest.main(["-q"])
+    return result
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="signaleyes-mcp")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("serve", help="Run the MCP server over stdio (default)")
+    sub.add_parser("test", help="Run the test suite")
+    smoke = sub.add_parser(
+        "smoke", help="Run one real query against SignalEyes to check the setup works"
+    )
+    smoke.add_argument(
+        "--entity", choices=SMOKE_ENTITIES, default=None, help="Defaults to a random entity"
+    )
+    smoke.add_argument("--polygon", default=SMOKE_POLYGON, help="WKT polygon in EPSG:4326")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _build_arg_parser().parse_args(argv)
+    command = args.command or "serve"
+
+    if command == "test":
+        raise SystemExit(run_tests())
+
     base_url = os.environ.get("SIGNALEYES_BASE_URL", "https://api.neo.nl/v1")
     username = os.environ.get("SIGNALEYES_USERNAME")
     password = os.environ.get("SIGNALEYES_PASSWORD")
@@ -117,6 +239,11 @@ def main() -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
+
+    if command == "smoke":
+        raise SystemExit(
+            asyncio.run(run_smoke(base_url, username, password, args.entity, args.polygon))
+        )
 
     server = build_server(base_url, username, password)
     server.run()

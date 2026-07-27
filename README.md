@@ -23,9 +23,16 @@ express them:
 - **`fetch_all_pages`** — `GET /source/{entity}` paginates via an
   `X-Total-Pages` response header, invisible to the auto-generated tools
   (they only see the JSON body). This walks every page and merges them into
-  one `FeatureCollection`.
+  one `FeatureCollection` — while still taking the same filters as the
+  single-page tool (`filter_string`, `geo_type`, `simplify`, `sample`,
+  `dissolve`, `intersect_centroid`), so filtering and full pagination aren't
+  a trade-off.
 - **`whoami`** — checks credentials by fetching `/subscriptions`, so a
   broken setup fails with one clear tool call instead of 100+ opaque 401s.
+
+All three (and every generated tool) raise with the API's actual `detail`
+message on 4xx/5xx responses, not just a bare status code — a 422 tells you
+*why* the polygon or filter was rejected.
 
 ## Setup
 
@@ -40,11 +47,18 @@ Credentials are SignalEyes API credentials (the same username/password used
 with the `/token` endpoints or HTTP Basic auth) — ask NEO for API access if
 you don't have one.
 
-Run directly to sanity-check it starts:
+`uv run signaleyes-mcp` takes a subcommand (defaults to `serve` if omitted —
+this is what an MCP client actually launches):
 
 ```bash
-uv run signaleyes-mcp
+uv run signaleyes-mcp            # serve over stdio (default)
+uv run signaleyes-mcp test       # run the test suite (uv run pytest, equivalently)
+uv run signaleyes-mcp smoke      # one real query against SignalEyes, to sanity-check credentials/setup
+uv run signaleyes-mcp smoke --entity tree --polygon "POLYGON ((...))"
 ```
+
+`smoke` needs `SIGNALEYES_USERNAME`/`PASSWORD` set (it hits the live API);
+`test` doesn't (everything but `test_live_spec.py` is mocked).
 
 ## Register with an MCP client
 
@@ -97,8 +111,12 @@ credentials needed, 100% statement coverage:
 - `test_build_server.py` — route-map exclusion/inclusion, auth wiring, spec
   fetch, error propagation.
 - `test_custom_tools.py` — `wait_for_task` (immediate/polled/failed/timeout),
-  `fetch_all_pages` (merging, variants, page cap), `whoami`.
-- `test_main.py` — `main()`'s env-var validation and success path.
+  `fetch_all_pages` (merging, variants, page cap, filter passthrough),
+  `whoami`.
+- `test_cli.py` — the `serve`/`test`/`smoke` argument parser, `run_tests`,
+  `run_smoke`, and `_check_response`'s detail-message extraction.
+- `test_main.py` — `main()`'s subcommand dispatch, env-var validation, and
+  success path.
 
 `test_live_spec.py` is marked `network` and excluded from the default run
 (`addopts = -m "not network"` in `pyproject.toml`); it hits the real public
