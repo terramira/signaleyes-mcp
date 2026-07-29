@@ -23,11 +23,48 @@ from fastmcp import FastMCP
 from fastmcp.server.providers.openapi import MCPType, RouteMap
 
 # Binary/XML endpoints an LLM tool call can't usefully consume: raw OGC WFS,
-# vector tiles, and DSM/DTM raster tiles. Everything else becomes a tool.
+# vector tiles, DSM/DTM raster tiles (their openapi.json entry claims
+# application/json, but they actually return image/tiff — confirmed by
+# direct request, not just spec-reading), the shadow-modelling raster, and
+# the usage-records XLSX export. Everything else becomes a tool.
 EXCLUDED_PATTERNS = (
     r"^/source/wfs/.*",
     r"^/source/tiles/.*",
-    r"^/source/(dsm|dtm)/\{quadkey\}$",
+    r"^/source/(dsm|dtm)(/pages)?(/\{quadkey\})?$",
+    r"^/analyses/shadow_modelling$",
+    r"^/usage/records$",
+)
+
+# These POST /source/* endpoints declare their request body as a bare JSON
+# string (the WKT polygon), not an object. FastMCP's OpenAPI request builder
+# sends bare-string bodies as raw unencoded bytes with no Content-Type header
+# instead of JSON-encoding them, so every one of these auto-generated tools
+# 400s upstream with a JSON decode error ("Expecting value") regardless of
+# input — confirmed by inspecting the outgoing request. `post_large_polygon`
+# below replaces them with one hand-built tool that serializes the body
+# correctly; object-bodied POSTs (the */batch id-lookup endpoints,
+# /source/geojson) are unaffected and stay auto-generated.
+_BROKEN_POLYGON_BODY_POST_PATTERNS = (
+    r"^/source/agriparcel$",
+    r"^/source/amsparcel$",
+    r"^/source/bag$",
+    r"^/source/building$",
+    r"^/source/building/\{entity\}$",
+    r"^/source/building/inactive/\{entity\}$",
+    r"^/source/building-risk$",
+    r"^/source/building-risk/hr$",
+    r"^/source/district$",
+    r"^/source/greenspace$",
+    r"^/source/imperviousness$",
+    r"^/source/landscape-element/\{entity\}$",
+    r"^/source/naturearea$",
+    r"^/source/neighborhood$",
+    r"^/source/road$",
+    r"^/source/solarpanel$",
+    r"^/source/thirdparty/\{identifier\}$",
+    r"^/source/tree$",
+    r"^/source/tree/\{entity\}$",
+    r"^/source/water$",
 )
 
 # A small real area (Venlo, NL) known to have buildings/trees/roads, used by
@@ -73,6 +110,10 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
     client = _make_client(base_url, username, password)
 
     route_maps = [RouteMap(pattern=p, mcp_type=MCPType.EXCLUDE) for p in EXCLUDED_PATTERNS]
+    route_maps.extend(
+        RouteMap(pattern=p, methods=["POST"], mcp_type=MCPType.EXCLUDE)
+        for p in _BROKEN_POLYGON_BODY_POST_PATTERNS
+    )
     route_maps.append(RouteMap(methods=["GET", "POST", "DELETE"], mcp_type=MCPType.TOOL))
 
     mcp = FastMCP.from_openapi(
@@ -85,7 +126,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
     @mcp.tool
     async def wait_for_task(
         task_id: str,
-        timeout: float = 120.0,
+        max_wait: float = 120.0,
         poll_interval: float = 2.0,
     ) -> dict[str, Any]:
         """Poll a SignalEyes background task until it finishes, then return its result.
@@ -95,21 +136,23 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         of a result. This collapses the manual GET /task/{id} polling loop
         into one call instead of many separate tool round-trips.
         """
-        max_polls = max(1, int(timeout / poll_interval))
-        for _ in range(max_polls):
-            status_resp = await client.get(f"/task/{task_id}")
-            _check_response(status_resp)
-            status_body = status_resp.json()
-            status = status_body["status"]
-            if status == "done":
-                result_resp = await client.get(f"/task/{task_id}/result")
-                _check_response(result_resp)
-                result: dict[str, Any] = result_resp.json()
-                return result
-            if status == "failed":
-                raise RuntimeError(f"Task {task_id} failed: {status_body.get('error')}")
-            await asyncio.sleep(poll_interval)
-        raise TimeoutError(f"Task {task_id} did not complete within {timeout}s")
+        try:
+            async with asyncio.timeout(max_wait):
+                while True:
+                    status_resp = await client.get(f"/task/{task_id}")
+                    _check_response(status_resp)
+                    status_body = status_resp.json()
+                    status = status_body["status"]
+                    if status == "done":
+                        result_resp = await client.get(f"/task/{task_id}/result")
+                        _check_response(result_resp)
+                        result: dict[str, Any] = result_resp.json()
+                        return result
+                    if status == "failed":
+                        raise RuntimeError(f"Task {task_id} failed: {status_body.get('error')}")
+                    await asyncio.sleep(poll_interval)
+        except TimeoutError as exc:
+            raise TimeoutError(f"Task {task_id} did not complete within {max_wait}s") from exc
 
     @mcp.tool
     async def fetch_all_pages(
@@ -160,6 +203,62 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
             "total_pages": total_pages,
             "pages_fetched": min(total_pages, max_pages),
         }
+
+    @mcp.tool
+    async def post_large_polygon(
+        entity: str,
+        polygon: str,
+        variant: str | None = None,
+        respond_async: bool = False,
+        filter_string: str | None = None,
+        page: int = 1,
+        geo_type: str | None = None,
+        simplify: float | None = None,
+        sample: float | None = None,
+        dissolve: bool | None = None,
+        intersect_centroid: bool | None = None,
+    ) -> dict[str, Any]:
+        """POST /source/{entity} with the polygon in the body — for AOIs too large for a GET query.
+
+        Replaces the auto-generated post_objects_*_post tools, which always
+        fail: the API declares these request bodies as a bare JSON string
+        (just the WKT polygon, not `{"polygon": ...}`), and FastMCP's OpenAPI
+        client sends bare-string bodies as raw unencoded bytes with no
+        Content-Type instead of JSON-encoding them, so the upstream API
+        rejects every call with a JSON decode error. This tool builds the
+        request by hand so the body is serialized correctly.
+
+        Set respond_async=True for large AOIs — the API replies with a task
+        ID immediately instead of gathering every page inline; resolve it
+        with wait_for_task.
+
+        Like the GET endpoint, results are paginated; the response carries
+        `total_pages`/`page` (from the X-Total-Pages/X-Page-Number headers)
+        so the caller knows whether to fetch more with `page=2`, etc. Covers
+        every entity/variant reachable as /source/{entity}[/{variant}]
+        except /source/building/inactive/{entity} (three path segments,
+        outside this tool's scheme — same gap fetch_all_pages already has).
+        """
+        path = f"/source/{entity}/{variant}" if variant else f"/source/{entity}"
+        params: dict[str, Any] = {
+            "filter_string": filter_string,
+            "page": page,
+            "geo_type": geo_type,
+            "simplify": simplify,
+            "sample": sample,
+            "dissolve": dissolve,
+            "intersect_centroid": intersect_centroid,
+        }
+        params = {k: v for k, v in params.items() if v is not None}
+        headers = {"Prefer": "respond-async"} if respond_async else {}
+
+        resp = await client.post(path, params=params, json=polygon, headers=headers)
+        _check_response(resp)
+        result: dict[str, Any] = resp.json()
+        if "X-Total-Pages" in resp.headers:
+            result["total_pages"] = int(resp.headers["X-Total-Pages"])
+            result["page"] = int(resp.headers.get("X-Page-Number", page))
+        return result
 
     @mcp.tool
     async def whoami() -> dict[str, Any]:

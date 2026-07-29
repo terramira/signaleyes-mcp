@@ -9,12 +9,15 @@ overlay, shadow modelling, ...) and predefined analyses (3/30/300, BAF+).
 Most tools aren't hand-written. At startup the server fetches the live
 `openapi.json` from the API and turns every HTTP operation into an MCP tool
 via `FastMCP.from_openapi` — so it always mirrors whatever endpoints the API
-currently exposes, without needing updates when the API changes. Raw OGC WFS,
-vector tile, and raster tile endpoints are excluded (binary/XML responses an
-LLM tool call can't use); everything else becomes a tool.
+currently exposes, without needing updates when the API changes. Raw OGC WFS, vector tile, and raster tile endpoints are excluded
+(binary/XML responses an LLM tool call can't use) — as are DSM/DTM
+source/pages, shadow-modelling, and usage-records, whose `openapi.json`
+entries claim `application/json` but which actually return an
+`image/tiff` raster or `.xlsx` export; everything else becomes a tool.
 
-On top of that, three tools are hand-written because the OpenAPI spec can't
-express them:
+On top of that, four tools are hand-written: three because the OpenAPI spec
+can't express them, and one because FastMCP's OpenAPI client mishandles a
+request-body shape the spec does use:
 
 - **`wait_for_task`** — many endpoints (concepts, analyses, async source
   fetches) return a `task_id` instead of a result. This polls
@@ -29,10 +32,27 @@ express them:
   a trade-off.
 - **`whoami`** — checks credentials by fetching `/subscriptions`, so a
   broken setup fails with one clear tool call instead of 100+ opaque 401s.
+- **`post_large_polygon`** — replaces the auto-generated `post_objects_*`
+  tools for every `POST /source/{entity}` route. Their request body is a
+  bare JSON string (the WKT polygon, not `{"polygon": ...}`); FastMCP's
+  OpenAPI client sends bare-string bodies as raw unencoded bytes with no
+  `Content-Type` instead of JSON-encoding them, so every one of those tools
+  400s upstream with a JSON decode error regardless of input. This tool
+  builds the request by hand so the body is serialized correctly, and
+  surfaces the same `X-Total-Pages`/`X-Page-Number` headers `fetch_all_pages`
+  does. (Object-bodied POSTs — the `*/batch` id-lookup endpoints,
+  `/source/geojson` — aren't affected and stay auto-generated.)
 
-All three (and every generated tool) raise with the API's actual `detail`
-message on 4xx/5xx responses, not just a bare status code — a 422 tells you
-*why* the polygon or filter was rejected.
+All hand-written tools (and every generated one) raise with the API's actual
+`detail` message on 4xx/5xx responses, not just a bare status code — a 422
+tells you *why* the polygon or filter was rejected.
+
+**A quirk worth knowing, not a bug:** the auto-generated `run_concept_aggregation`
+and `run_concept_difference_area` tools work correctly, but their `geojson`
+parameter is misleadingly named — pass `{"geojson_list": [...]}` as its
+value, not a bare FeatureCollection. The requestBody schema's `"title"` says
+"Geojson" (which FastMCP uses to name the flattened parameter), but the
+schema it actually `$ref`s is `GeoJsonList`.
 
 ## Setup
 

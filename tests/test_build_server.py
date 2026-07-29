@@ -33,17 +33,36 @@ def test_raster_quadkey_endpoints_excluded(mock_spec_get, spy_async_client, name
     assert name not in _tool_names(server)
 
 
-def test_dsm_pages_not_excluded_by_quadkey_pattern(mock_spec_get, spy_async_client):
-    """Only the raw raster quadkey routes are excluded — sibling metadata routes stay."""
+@pytest.mark.parametrize("name", ["dsm_pages", "shadow_modelling", "usage_records"])
+def test_binary_response_endpoints_excluded(mock_spec_get, spy_async_client, name):
+    """These routes return raw image/tiff or xlsx bytes despite claiming application/json
+    in the spec (confirmed against the live API) — a JSON tool result can't carry them."""
     server = build_server("https://example.test/v1", "user", "pass")
-    assert "dsm_pages" in _tool_names(server)
+    assert name not in _tool_names(server)
+
+
+def test_dsm_pages_metadata_not_excluded_by_binary_pattern(mock_spec_get, spy_async_client):
+    """Sibling metadata routes (real JSON) stay tools; only the binary routes are excluded."""
+    server = build_server("https://example.test/v1", "user", "pass")
+    assert "dsm_pages_metadata" in _tool_names(server)
 
 
 def test_normal_source_endpoints_become_tools(mock_spec_get, spy_async_client):
     server = build_server("https://example.test/v1", "user", "pass")
     names = _tool_names(server)
     assert "get_building" in names
-    assert "post_building" in names
+
+
+def test_bare_string_body_source_post_replaced_by_post_large_polygon(
+    mock_spec_get, spy_async_client
+):
+    """POST /source/building's body is a bare WKT string, which FastMCP's OpenAPI client
+    sends unserialized — the auto-generated tool always 400s upstream, so it's excluded
+    in favor of the hand-written post_large_polygon tool."""
+    server = build_server("https://example.test/v1", "user", "pass")
+    names = _tool_names(server)
+    assert "post_building" not in names
+    assert "post_large_polygon" in names
 
 
 def test_get_and_delete_endpoints_become_tools(mock_spec_get, spy_async_client):

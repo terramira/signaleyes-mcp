@@ -87,7 +87,7 @@ def test_wait_for_task_raises_timeout_when_never_done(
     )
 
     with pytest.raises(ToolError, match="did not complete"):
-        _call(server, "wait_for_task", {"task_id": "t1", "timeout": 4, "poll_interval": 2})
+        _call(server, "wait_for_task", {"task_id": "t1", "max_wait": 4, "poll_interval": 2})
 
 
 # --- fetch_all_pages ---------------------------------------------------------
@@ -192,6 +192,143 @@ def test_fetch_all_pages_caps_at_max_pages(mock_spec_get, spy_async_client, asyn
     assert result.structured_content["pages_fetched"] == 2
     assert result.structured_content["total_pages"] == 5
     assert len(async_client_get_queue.calls) == 2
+
+
+# --- post_large_polygon --------------------------------------------------
+
+
+def test_post_large_polygon_sends_polygon_as_json_body(
+    mock_spec_get, spy_async_client, async_client_post_queue
+):
+    """The bug this tool exists to work around: the API wants the polygon
+    JSON-encoded as the request body, not appended as a query param."""
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_post_queue.responses.append(
+        _response(json={"type": "FeatureCollection", "features": []})
+    )
+
+    _call(server, "post_large_polygon", {"entity": "bag", "polygon": "POLYGON ((0 0))"})
+
+    call = async_client_post_queue.calls[0]
+    assert call["url"] == "/source/bag"
+    assert call["json"] == "POLYGON ((0 0))"
+    assert call["params"] == {"page": 1}
+
+
+def test_post_large_polygon_surfaces_pagination_headers(
+    mock_spec_get, spy_async_client, async_client_post_queue
+):
+    """The API paginates POST results the same way it paginates GET results —
+    the caller needs total_pages/page to know whether to fetch page=2, etc."""
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_post_queue.responses.append(
+        _response(
+            json={"type": "FeatureCollection", "features": []},
+            headers={"X-Total-Pages": "3", "X-Page-Number": "1"},
+        )
+    )
+
+    result = _call(server, "post_large_polygon", {"entity": "bag", "polygon": "POLYGON ((0 0))"})
+
+    assert result.structured_content["total_pages"] == 3
+    assert result.structured_content["page"] == 1
+
+
+def test_post_large_polygon_omits_pagination_keys_when_headers_absent(
+    mock_spec_get, spy_async_client, async_client_post_queue
+):
+    """respond_async=True gets back a task-id body with no pagination headers."""
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_post_queue.responses.append(_response(json={"id": "t1", "status": "running"}))
+
+    result = _call(
+        server,
+        "post_large_polygon",
+        {"entity": "bag", "polygon": "POLYGON ((0 0))", "respond_async": True},
+    )
+
+    assert "total_pages" not in result.structured_content
+    assert "page" not in result.structured_content
+
+
+def test_post_large_polygon_uses_variant_path(
+    mock_spec_get, spy_async_client, async_client_post_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_post_queue.responses.append(
+        _response(json={"type": "FeatureCollection", "features": []})
+    )
+
+    _call(
+        server,
+        "post_large_polygon",
+        {"entity": "tree", "variant": "crown", "polygon": "POLYGON ((0 0))"},
+    )
+
+    assert async_client_post_queue.calls[0]["url"] == "/source/tree/crown"
+
+
+def test_post_large_polygon_sets_respond_async_header(
+    mock_spec_get, spy_async_client, async_client_post_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_post_queue.responses.append(_response(json={"id": "t1", "status": "running"}))
+
+    _call(
+        server,
+        "post_large_polygon",
+        {"entity": "bag", "polygon": "POLYGON ((0 0))", "respond_async": True},
+    )
+
+    assert async_client_post_queue.calls[0]["headers"] == {"Prefer": "respond-async"}
+
+
+def test_post_large_polygon_omits_unset_optional_params(
+    mock_spec_get, spy_async_client, async_client_post_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_post_queue.responses.append(
+        _response(json={"type": "FeatureCollection", "features": []})
+    )
+
+    _call(server, "post_large_polygon", {"entity": "bag", "polygon": "POLYGON ((0 0))"})
+
+    assert async_client_post_queue.calls[0]["params"] == {"page": 1}
+    assert async_client_post_queue.calls[0]["headers"] == {}
+
+
+def test_post_large_polygon_passes_through_filters(
+    mock_spec_get, spy_async_client, async_client_post_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_post_queue.responses.append(
+        _response(json={"type": "FeatureCollection", "features": []})
+    )
+
+    _call(
+        server,
+        "post_large_polygon",
+        {
+            "entity": "bag",
+            "polygon": "POLYGON ((0 0))",
+            "filter_string": "height=10",
+            "geo_type": "centroid",
+            "simplify": 0.5,
+            "sample": 0.2,
+            "dissolve": False,
+            "intersect_centroid": False,
+        },
+    )
+
+    assert async_client_post_queue.calls[0]["params"] == {
+        "page": 1,
+        "filter_string": "height=10",
+        "geo_type": "centroid",
+        "simplify": 0.5,
+        "sample": 0.2,
+        "dissolve": False,
+        "intersect_centroid": False,
+    }
 
 
 # --- whoami -------------------------------------------------------------

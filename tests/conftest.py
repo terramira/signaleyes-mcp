@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
@@ -33,6 +35,9 @@ def fake_spec() -> dict:
             "/source/dsm/{quadkey}": {"get": op("dsm_quadkey", ("quadkey",))},
             "/source/dtm/{quadkey}": {"get": op("dtm_quadkey", ("quadkey",))},
             "/source/dsm/pages": {"get": op("dsm_pages")},
+            "/source/dsm/pages/metadata": {"get": op("dsm_pages_metadata")},
+            "/analyses/shadow_modelling": {"get": op("shadow_modelling")},
+            "/usage/records": {"get": op("usage_records")},
             "/source/building": {"get": op("get_building"), "post": op("post_building")},
             "/task/{task_id}": {
                 "get": op("get_task", ("task_id",)),
@@ -89,10 +94,40 @@ def async_client_get_queue(monkeypatch):
 
 
 @pytest.fixture
-def fast_sleep(monkeypatch):
-    """Skip real delays in asyncio.sleep so polling-loop tests run instantly."""
+def async_client_post_queue(monkeypatch):
+    """Like async_client_get_queue, but for POST — also records the json body sent."""
+    state = SimpleNamespace(responses=[], calls=[])
 
-    async def instant_sleep(seconds):
-        return None
+    async def fake_post(self, url, params=None, json=None, headers=None, **kwargs):
+        state.calls.append({"url": url, "params": params, "json": json, "headers": headers})
+        return state.responses.pop(0)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    return state
+
+
+@pytest.fixture
+def fast_sleep(monkeypatch):
+    """Skip real delays in asyncio.sleep so polling-loop tests run instantly.
+
+    Also replaces asyncio.timeout with a virtual-time version so deadlines
+    still fire when sleep is a no-op against the wall clock.
+    """
+    elapsed = {"t": 0.0}
+    deadline = {"t": None}
+
+    async def instant_sleep(seconds: float) -> None:
+        elapsed["t"] += seconds
+        if deadline["t"] is not None and elapsed["t"] >= deadline["t"]:
+            raise TimeoutError()
+
+    @asynccontextmanager
+    async def instant_timeout(delay: float) -> AsyncIterator[None]:
+        deadline["t"] = elapsed["t"] + delay
+        try:
+            yield
+        finally:
+            deadline["t"] = None
 
     monkeypatch.setattr("signaleyes_mcp.server.asyncio.sleep", instant_sleep)
+    monkeypatch.setattr("signaleyes_mcp.server.asyncio.timeout", instant_timeout)
