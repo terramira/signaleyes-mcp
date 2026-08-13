@@ -194,6 +194,70 @@ def test_fetch_all_pages_caps_at_max_pages(mock_spec_get, spy_async_client, asyn
     assert len(async_client_get_queue.calls) == 2
 
 
+def test_fetch_all_pages_default_max_pages_caps_at_ten(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    """Defaults low (not "all") so an unexpectedly large area doesn't flood context."""
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.extend(
+        [
+            _response(json={"features": [{"id": p}]}, headers={"X-Total-Pages": "50"})
+            for p in range(1, 11)
+        ]
+    )
+
+    result = _call(server, "fetch_all_pages", {"entity": "building", "polygon": "POLYGON ((0 0))"})
+
+    assert result.structured_content["pages_fetched"] == 10
+    assert len(async_client_get_queue.calls) == 10
+
+
+def test_fetch_all_pages_passes_through_attributes_and_groupby(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(json={"features": []}, headers={"X-Total-Pages": "1"})
+    )
+
+    _call(
+        server,
+        "fetch_all_pages",
+        {
+            "entity": "thirdparty",
+            "variant": "rdw",
+            "polygon": "POLYGON ((0 0))",
+            "attributes": "name,height",
+            "groupby": "name",
+        },
+    )
+
+    assert async_client_get_queue.calls[0]["params"] == {
+        "polygon": "POLYGON ((0 0))",
+        "page": 1,
+        "attributes": "name,height",
+        "groupby": "name",
+    }
+
+
+def test_fetch_all_pages_respond_async_returns_task_without_paginating(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(_response(json={"id": "t1", "status": "running"}))
+
+    result = _call(
+        server,
+        "fetch_all_pages",
+        {"entity": "building", "polygon": "POLYGON ((0 0))", "respond_async": True},
+    )
+
+    assert result.structured_content == {"id": "t1", "status": "running"}
+    assert len(async_client_get_queue.calls) == 1
+    assert async_client_get_queue.calls[0]["headers"] == {"Prefer": "respond-async"}
+    assert async_client_get_queue.calls[0]["params"] == {"polygon": "POLYGON ((0 0))"}
+
+
 # --- post_large_polygon --------------------------------------------------
 
 
@@ -352,3 +416,172 @@ def test_whoami_propagates_http_error(mock_spec_get, spy_async_client, async_cli
 
     with pytest.raises(ToolError):
         _call(server, "whoami", {})
+
+
+# --- get_object_by_id -----------------------------------------------------
+
+
+def test_get_object_by_id_no_variant(mock_spec_get, spy_async_client, async_client_get_queue):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(_response(json={"id": "42", "type": "Feature"}))
+
+    result = _call(server, "get_object_by_id", {"entity": "agriparcel", "object_id": "42"})
+
+    assert result.structured_content == {"id": "42", "type": "Feature"}
+    assert async_client_get_queue.calls[0]["url"] == "/source/agriparcel/42"
+
+
+def test_get_object_by_id_with_variant(mock_spec_get, spy_async_client, async_client_get_queue):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(_response(json={"id": "42", "type": "Feature"}))
+
+    _call(
+        server,
+        "get_object_by_id",
+        {"entity": "building", "object_id": "42", "variant": "school"},
+    )
+
+    assert async_client_get_queue.calls[0]["url"] == "/source/building/school/42"
+
+
+def test_get_object_by_id_missing_required_variant_raises(mock_spec_get, spy_async_client):
+    server = _server(mock_spec_get, spy_async_client)
+
+    with pytest.raises(ToolError, match="requires a variant"):
+        _call(server, "get_object_by_id", {"entity": "building", "object_id": "42"})
+
+
+def test_get_object_by_id_unsupported_variant_raises(mock_spec_get, spy_async_client):
+    server = _server(mock_spec_get, spy_async_client)
+
+    with pytest.raises(ToolError, match="doesn't take a variant"):
+        _call(
+            server,
+            "get_object_by_id",
+            {"entity": "agriparcel", "object_id": "42", "variant": "x"},
+        )
+
+
+def test_get_object_by_id_unknown_entity_raises(mock_spec_get, spy_async_client):
+    server = _server(mock_spec_get, spy_async_client)
+
+    with pytest.raises(ToolError, match="no by_id endpoint"):
+        _call(server, "get_object_by_id", {"entity": "nope", "object_id": "1"})
+
+
+# --- post_objects_by_ids ---------------------------------------------------
+
+
+def test_post_objects_by_ids_sends_ids_body(
+    mock_spec_get, spy_async_client, async_client_post_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_post_queue.responses.append(
+        _response(json={"type": "FeatureCollection", "features": []})
+    )
+
+    _call(server, "post_objects_by_ids", {"entity": "agriparcel", "ids": ["1", "2"]})
+
+    call = async_client_post_queue.calls[0]
+    assert call["url"] == "/source/agriparcel/batch"
+    assert call["json"] == {"ids": ["1", "2"]}
+
+
+def test_post_objects_by_ids_with_variant(mock_spec_get, spy_async_client, async_client_post_queue):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_post_queue.responses.append(
+        _response(json={"type": "FeatureCollection", "features": []})
+    )
+
+    _call(
+        server,
+        "post_objects_by_ids",
+        {"entity": "building", "ids": ["1"], "variant": "school"},
+    )
+
+    assert async_client_post_queue.calls[0]["url"] == "/source/building/school/batch"
+
+
+# --- get_objects_metadata ---------------------------------------------------
+
+
+def test_get_objects_metadata_no_variant(mock_spec_get, spy_async_client, async_client_get_queue):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(_response(json={"fields": ["height"]}))
+
+    result = _call(server, "get_objects_metadata", {"entity": "agriparcel"})
+
+    assert result.structured_content == {"fields": ["height"]}
+    assert async_client_get_queue.calls[0]["url"] == "/source/agriparcel/metadata"
+
+
+def test_get_objects_metadata_with_variant(mock_spec_get, spy_async_client, async_client_get_queue):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(_response(json={"fields": []}))
+
+    _call(server, "get_objects_metadata", {"entity": "building", "variant": "school"})
+
+    assert async_client_get_queue.calls[0]["url"] == "/source/building/school/metadata"
+
+
+# --- list_source_entities ---------------------------------------------------
+
+
+def test_list_source_entities_describes_support_matrix(mock_spec_get, spy_async_client):
+    server = _server(mock_spec_get, spy_async_client)
+
+    result = _call(server, "list_source_entities", {})
+
+    described = result.structured_content
+    assert described["agriparcel"] == {
+        "list": "no variant",
+        "by_id": "no variant",
+        "metadata": "no variant",
+        "batch": "no variant",
+    }
+    assert described["building"]["list"] == "variant optional"
+    assert described["building"]["by_id"] == "variant required"
+    assert described["building_inactive"]["list"] == "variant required"
+    assert "by_id" not in described["dsm_pages"]
+
+
+# --- manage_task -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("view", "url"),
+    [
+        ("status", "/task/t1"),
+        ("describe", "/task/t1/describe"),
+        ("metadata", "/task/t1/metadata"),
+        ("result", "/task/t1/result"),
+    ],
+)
+def test_manage_task_views_hit_the_right_url(
+    mock_spec_get, spy_async_client, async_client_get_queue, view, url
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(_response(json={"ok": True}))
+
+    result = _call(server, "manage_task", {"task_id": "t1", "view": view})
+
+    assert result.structured_content == {"ok": True}
+    assert async_client_get_queue.calls[0]["url"] == url
+
+
+def test_manage_task_defaults_to_status_view(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(_response(json={"status": "running"}))
+
+    _call(server, "manage_task", {"task_id": "t1"})
+
+    assert async_client_get_queue.calls[0]["url"] == "/task/t1"
+
+
+def test_manage_task_rejects_unknown_view(mock_spec_get, spy_async_client):
+    server = _server(mock_spec_get, spy_async_client)
+
+    with pytest.raises(ToolError, match="view must be one of"):
+        _call(server, "manage_task", {"task_id": "t1", "view": "delete"})

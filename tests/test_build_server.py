@@ -41,16 +41,101 @@ def test_binary_response_endpoints_excluded(mock_spec_get, spy_async_client, nam
     assert name not in _tool_names(server)
 
 
-def test_dsm_pages_metadata_not_excluded_by_binary_pattern(mock_spec_get, spy_async_client):
-    """Sibling metadata routes (real JSON) stay tools; only the binary routes are excluded."""
+def test_dsm_pages_metadata_excluded_in_favor_of_get_objects_metadata(
+    mock_spec_get, spy_async_client
+):
+    """Not excluded by the binary-response pattern (it's real JSON) — excluded because
+    every /source/*/metadata route, including this one, folds into get_objects_metadata."""
     server = build_server("https://example.test/v1", "user", "pass")
-    assert "dsm_pages_metadata" in _tool_names(server)
+    assert "dsm_pages_metadata" not in _tool_names(server)
+    assert "get_objects_metadata" in _tool_names(server)
 
 
-def test_normal_source_endpoints_become_tools(mock_spec_get, spy_async_client):
+def test_subscriptions_excluded_in_favor_of_whoami(mock_spec_get, spy_async_client):
     server = build_server("https://example.test/v1", "user", "pass")
     names = _tool_names(server)
-    assert "get_building" in names
+    assert "get_subscriptions" not in names
+    assert "whoami" in names
+
+
+@pytest.mark.parametrize("name", ["token_generate", "token_refresh", "token_revoke"])
+def test_token_endpoints_excluded(mock_spec_get, spy_async_client, name):
+    """These issue OAuth2 bearer tokens the server's fixed Basic-auth client never uses."""
+    server = build_server("https://example.test/v1", "user", "pass")
+    assert name not in _tool_names(server)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "get_building",  # bare list GET
+        "get_building_entity",  # variant list GET
+        "get_agriparcel",  # bare list GET, no variant scheme at all
+    ],
+)
+def test_single_page_list_get_excluded_in_favor_of_fetch_all_pages(
+    mock_spec_get, spy_async_client, name
+):
+    server = build_server("https://example.test/v1", "user", "pass")
+    names = _tool_names(server)
+    assert name not in names
+    assert "fetch_all_pages" in names
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "get_agriparcel_by_id",
+        "get_building_by_id",
+        "get_building_inactive_by_id",
+    ],
+)
+def test_by_id_endpoints_excluded_in_favor_of_get_object_by_id(
+    mock_spec_get, spy_async_client, name
+):
+    server = build_server("https://example.test/v1", "user", "pass")
+    names = _tool_names(server)
+    assert name not in names
+    assert "get_object_by_id" in names
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "get_agriparcel_metadata",
+        "get_building_entity_metadata",
+        "get_building_inactive_metadata",
+    ],
+)
+def test_metadata_endpoints_excluded_in_favor_of_get_objects_metadata(
+    mock_spec_get, spy_async_client, name
+):
+    server = build_server("https://example.test/v1", "user", "pass")
+    names = _tool_names(server)
+    assert name not in names
+    assert "get_objects_metadata" in names
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "post_agriparcel_batch",
+        "post_building_batch",
+        "post_building_inactive_batch",
+    ],
+)
+def test_batch_endpoints_excluded_in_favor_of_post_objects_by_ids(
+    mock_spec_get, spy_async_client, name
+):
+    server = build_server("https://example.test/v1", "user", "pass")
+    names = _tool_names(server)
+    assert name not in names
+    assert "post_objects_by_ids" in names
+
+
+def test_list_source_entities_tool_present(mock_spec_get, spy_async_client):
+    server = build_server("https://example.test/v1", "user", "pass")
+    assert "list_source_entities" in _tool_names(server)
 
 
 def test_bare_string_body_source_post_replaced_by_post_large_polygon(
@@ -65,11 +150,19 @@ def test_bare_string_body_source_post_replaced_by_post_large_polygon(
     assert "post_large_polygon" in names
 
 
-def test_get_and_delete_endpoints_become_tools(mock_spec_get, spy_async_client):
+def test_task_read_endpoints_excluded_in_favor_of_manage_task(mock_spec_get, spy_async_client):
     server = build_server("https://example.test/v1", "user", "pass")
     names = _tool_names(server)
-    assert "get_task" in names
-    assert "delete_task" in names
+    for excluded in ("get_task", "describe_task", "task_metadata", "task_result"):
+        assert excluded not in names
+    assert "manage_task" in names
+
+
+def test_delete_task_stays_its_own_tool(mock_spec_get, spy_async_client):
+    """manage_task only covers reads — deletion needs its own tool so an MCP client
+    that allowlists reads on manage_task doesn't thereby approve deleting a task."""
+    server = build_server("https://example.test/v1", "user", "pass")
+    assert "delete_task" in _tool_names(server)
 
 
 def test_no_duplicate_tool_names(mock_spec_get, spy_async_client):
@@ -100,6 +193,13 @@ def test_returns_fastmcp_server_named_signaleyes(mock_spec_get, spy_async_client
     server = build_server("https://example.test/v1", "user", "pass")
     assert isinstance(server, FastMCP)
     assert server.name == "SignalEyes API"
+
+
+def test_server_has_workflow_instructions(mock_spec_get, spy_async_client):
+    server = build_server("https://example.test/v1", "user", "pass")
+    assert server.instructions
+    assert "list_source_entities" in server.instructions
+    assert "wait_for_task" in server.instructions
 
 
 def test_spec_fetch_http_error_propagates(monkeypatch):
