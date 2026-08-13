@@ -224,6 +224,16 @@ Type-check with `uv run mypy src/`.
 - **`release.yml`** — on pushing a tag `vX.Y.Z`: verifies the tag matches
   `pyproject.toml`'s version, re-runs lint/tests, then creates a GitHub
   release.
+- **`mcp-capability-check.yml`** — weekly (`workflow_dispatch` also
+  available): an agent checks whether a recent FastMCP/MCP-spec release
+  introduced a primitive that could replace hand-rolled code in
+  `server.py`. Dependabot already catches new dependency *versions*; this
+  catches new dependency *capabilities* — the two aren't the same thing,
+  and only the second one can make code here obsolete. It never edits
+  `src/`/`tests/` and never merges anything itself: a finding becomes a
+  written proposal under `docs/capability-findings/` in its own PR, for a
+  human to size up and implement deliberately. Needs an `ANTHROPIC_API_KEY`
+  repository secret to run.
 - **Dependabot** — weekly updates for both the `uv` and `github-actions`
   ecosystems.
 - **`.pre-commit-config.yaml`** — `ruff check --fix` + `ruff format` before

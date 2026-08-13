@@ -1,0 +1,106 @@
+name: MCP capability check
+
+# Dependabot already tells us "a dependency has a new version" (weekly).
+# network-canary.yml already tells us "the SignalEyes API spec changed"
+# (daily). Neither catches the third kind of drift: FastMCP or the MCP spec
+# itself gaining a primitive that makes something hand-rolled in this repo
+# redundant — e.g. a native task/polling extension that could replace
+# wait_for_task/manage_task, or a client-shape change that changes how
+# build_server() should construct things.
+#
+# This job researches recent FastMCP/MCP-spec changes and, only if it finds
+# something concrete, opens a PR proposing it — never code, only a written
+# finding under docs/capability-findings/, for a human to size up and
+# implement deliberately (the same way the tool-consolidation work in this
+# repo was: researched, then hand-verified against the live API before
+# merging). No SIGNALEYES_* credentials are used or needed; the analysis is
+# entirely about upstream FastMCP/MCP releases and this repo's own source.
+#
+# SECURITY NOTE: this repo currently has no branch protection on `master`,
+# so the `contents: write` permission below is broader than the workflow
+# needs in principle (it only ever pushes to a new `mcp-capability/*`
+# branch). Enabling required-PR-review branch protection on `master` would
+# close that gap; until then, this workflow's actual safety backstop is
+# that it never merges anything itself.
+
+on:
+  schedule:
+    - cron: "0 7 * * MON"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Research and propose
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: >-
+            --allowedTools
+            "Read,Grep,Glob,WebFetch,WebSearch,Write,
+            Bash(git checkout -b *),Bash(git add *),Bash(git commit *),Bash(git push *),
+            Bash(gh pr create *),Bash(gh pr list *)"
+          prompt: |
+            REPO: ${{ github.repository }}
+
+            This repo (signaleyes-mcp) is an MCP server built with
+            FastMCP.from_openapi: most tools are auto-generated from a live
+            OpenAPI spec, plus a handful of hand-written tools for things
+            FastMCP/the spec can't do natively (see src/signaleyes_mcp/server.py
+            and README.md for the current design and its rationale).
+
+            ## Task
+
+            Check whether FastMCP (https://github.com/PrefectHQ/fastmcp,
+            docs.mcp.run / gofastmcp.com changelog) or the MCP spec itself
+            (https://github.com/modelcontextprotocol/modelcontextprotocol)
+            has released, in roughly the last 1-2 months, a primitive or
+            capability that could replace or simplify hand-rolled code
+            already in src/signaleyes_mcp/server.py. Read that file and
+            README.md first so you know what's actually hand-rolled and why.
+
+            Calibration for what counts (don't limit yourself to these, but
+            this is the bar): FastMCP 4.0.0b1 added MCP's native background-
+            task extension (SEP-2663) — worth checking whether it covers the
+            poll-until-done pattern wait_for_task/manage_task implement by
+            hand. FastMCP's SDK migrated its bundled HTTP client
+            (httpx -> httpx2 in v4) — worth checking whether that, or any
+            other v4 change, affects how build_server() constructs its
+            client or route maps. A version bump alone, or a change with no
+            concrete code-simplification angle, does NOT count — Dependabot
+            already covers plain version bumps.
+
+            ## If you find nothing concrete
+
+            Do nothing. Do not create a branch, file, or PR. Exit.
+
+            ## If you find something concrete
+
+            First run `gh pr list --state all --search "capability check"`
+            to check whether a PR already covers this finding (by upstream
+            release, not just by title wording) — if so, do nothing.
+
+            Otherwise:
+            1. Create a branch: `mcp-capability/<short-slug>`.
+            2. Add ONE new markdown file under `docs/capability-findings/`
+               (create the directory if needed), named
+               `YYYY-MM-DD-<short-slug>.md`, containing: what changed
+               upstream (with a link), which specific code in
+               src/signaleyes_mcp/server.py it could replace or simplify,
+               and a concrete sketch of the change — but not the change
+               itself.
+            3. Do NOT modify anything under src/ or tests/. This job's job
+               is to surface a well-researched proposal, not to ship code
+               against a server that talks to a paid live API without the
+               kind of hands-on verification a real implementation needs.
+            4. Commit, push the branch, and open a PR with
+               `gh pr create --title "capability check: <one line>" --body <written finding>`.
+               Never merge it yourself.
