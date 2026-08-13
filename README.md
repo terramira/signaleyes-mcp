@@ -75,7 +75,12 @@ tools — one `GET .../{id}`, one `GET .../metadata`, and one
 - **`wait_for_task`** — many endpoints (concepts, analyses, async source
   fetches) return a `task_id` instead of a result. This polls
   `GET /task/{id}` until it's `done`/`failed` and returns the result in one
-  call, instead of the caller manually re-polling turn after turn.
+  call, instead of the caller manually re-polling turn after turn. A single
+  slow poll doesn't fail the whole call — retried on the next tick, still
+  bounded by `max_wait` — since the shared HTTP client's timeout (10s
+  connect / 60s read; observed necessary for `/describe` and `/result` on
+  large datasets) can still occasionally be hit by one request without the
+  task itself having failed.
 - **`manage_task`** — the four `GET /task/{id}(/*)` reads
   (`status`/`describe`/`metadata`/`result`) behind one `view` argument.
   Deletion is deliberately not a `view` here — it stays the auto-generated
@@ -102,8 +107,19 @@ end-to-end workflow: discover → fetch → look up → chain a concept → wait
 the task — since knowing *which* tool exists is only half the problem an
 agent runs into here.
 
-**A quirk worth knowing, not a bug:** the auto-generated `run_concept_aggregation`
-and `run_concept_difference_area` tools work correctly, but their `geojson`
+The auto-generated tools that stay auto-generated (`concept_*`, `analyses_*`,
+`post_geojson`, `usage_summary`, `delete_task`) get short, stable names via
+`mcp_names` instead of FastMCP's default — the raw OpenAPI `operationId`,
+which for this API's FastAPI-generated spec repeats the function name and
+path (`get_task_concept_overlay_concept_overlay_get`). Every session that
+connects pays for tool-name length, so this isn't just cosmetic. Where an
+operation has both a GET (task_id-chaining) and POST (live-entity) form —
+`concept_closest`, `concept_density_area`, `concept_density_count` — the GET
+one keeps the plain name, since it's the one this server's skill recommends
+by default; POST gets a `_from_entity` suffix.
+
+**A quirk worth knowing, not a bug:** the auto-generated `concept_aggregation`
+and `concept_difference_area` tools work correctly, but their `geojson`
 parameter is misleadingly named — pass `{"geojson_list": [...]}` as its
 value, not a bare FeatureCollection. The requestBody schema's `"title"` says
 "Geojson" (which FastMCP uses to name the flattened parameter), but the
