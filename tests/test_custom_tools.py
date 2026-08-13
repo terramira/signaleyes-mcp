@@ -90,6 +90,45 @@ def test_wait_for_task_raises_timeout_when_never_done(
         _call(server, "wait_for_task", {"task_id": "t1", "max_wait": 4, "poll_interval": 2})
 
 
+def test_wait_for_task_retries_past_a_transient_timeout(
+    mock_spec_get, spy_async_client, async_client_get_queue, fast_sleep
+):
+    """A slow poll doesn't mean the task failed — the field case this guards against:
+    the task was already 'done' upstream, but the /task/{id} poll itself timed out,
+    and the old behavior surfaced that as a hard failure instead of retrying."""
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.extend(
+        [
+            httpx.TimeoutException("timed out"),
+            _response(json={"id": "t1", "status": "done", "error": None}),
+            _response(json={"type": "FeatureCollection", "features": [{"id": 1}]}),
+        ]
+    )
+
+    result = _call(server, "wait_for_task", {"task_id": "t1"})
+
+    assert result.structured_content["features"] == [{"id": 1}]
+    assert len(async_client_get_queue.calls) == 3
+
+
+def test_wait_for_task_retries_a_timeout_on_the_result_fetch_too(
+    mock_spec_get, spy_async_client, async_client_get_queue, fast_sleep
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.extend(
+        [
+            _response(json={"id": "t1", "status": "done", "error": None}),
+            httpx.TimeoutException("timed out"),
+            _response(json={"id": "t1", "status": "done", "error": None}),
+            _response(json={"type": "FeatureCollection", "features": [{"id": 1}]}),
+        ]
+    )
+
+    result = _call(server, "wait_for_task", {"task_id": "t1"})
+
+    assert result.structured_content["features"] == [{"id": 1}]
+
+
 # --- fetch_all_pages ---------------------------------------------------------
 
 

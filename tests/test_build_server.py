@@ -4,8 +4,10 @@ import asyncio
 
 import httpx
 import pytest
+from spec_helpers import make_spec, op
 
 from signaleyes_mcp import build_server
+from signaleyes_mcp.server import MCP_NAMES
 
 
 def _tool_names(server) -> list[str]:
@@ -185,6 +187,43 @@ def test_client_uses_basic_auth_with_given_credentials(mock_spec_get, spy_async_
     flow = auth.sync_auth_flow(request)
     signed_request = next(flow)
     assert signed_request.headers["Authorization"].startswith("Basic ")
+
+
+def test_client_uses_a_longer_than_default_timeout(mock_spec_get, spy_async_client):
+    """httpx's 5s default has been observed too tight for /describe, /result, and
+    delete_task on this API — a merely-slow (not stuck) request shouldn't read as
+    a hard failure to every tool sharing this client."""
+    build_server("https://example.test/v1", "user", "pass")
+    timeout = spy_async_client["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.connect == 10.0
+    assert timeout.read == 60.0
+
+
+def test_mcp_names_shortens_every_mapped_operation(monkeypatch, spy_async_client):
+    """Concept/analyses/task/geojson tools stay auto-generated, but FastMCP's
+    default name is the raw operationId — FastAPI's, in particular, repeat the
+    function name and path. Build a spec covering every real long operationId
+    MCP_NAMES maps (rather than the short synthetic ones the shared fake_spec
+    fixture uses) and confirm each comes out as its mapped short name. Covers
+    every entry, not just one, since MCP_NAMES is hand-maintained — a
+    stale/typo'd key silently falls back to the raw, unshortened name instead
+    of erroring, so only exercising the whole mapping catches that in CI."""
+    spec = make_spec(
+        {f"/synthetic/{i}": {"get": op(long_id)} for i, long_id in enumerate(MCP_NAMES)}
+    )
+
+    def fake_get(url, timeout=None):
+        request = httpx.Request("GET", url)
+        return httpx.Response(200, json=spec, request=request)
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    server = build_server("https://example.test/v1", "user", "pass")
+    names = set(_tool_names(server))
+    for long_id, short_name in MCP_NAMES.items():
+        assert short_name in names, f"{long_id} -> {short_name} did not take effect"
+        assert long_id not in names, f"{long_id} leaked through unshortened"
 
 
 def test_returns_fastmcp_server_named_signaleyes(mock_spec_get, spy_async_client):

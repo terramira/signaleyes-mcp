@@ -96,6 +96,39 @@ SMOKE_ENTITIES = ("building", "tree", "road", "water", "solarpanel")
 # a /source/{entity}/{id} "single record" route while deriving the registry.
 _VARIANT_PARAM_NAMES = ("entity", "identifier")
 
+# The concept/analyses/task/geojson operations stay auto-generated (see the
+# module docstring for why), but FastMCP's default tool name is the raw
+# OpenAPI operationId — FastAPI's auto-generated ones, in particular, repeat
+# the function name and path (e.g. "get_task_concept_overlay_concept_overlay_get").
+# Every session that connects pays for that length when tools are listed.
+# Mapped here to short, stable names instead; keyed by the exact operationId
+# so a wrong/renamed key just silently falls back to the default rather than
+# erroring — verify against a fresh openapi.json if a name below goes missing.
+# Where an operation has both a GET (task_id-chaining) and POST (live-entity)
+# form, the GET one — the one this server's skill recommends by default —
+# keeps the plain name; POST gets a "_from_entity" suffix.
+MCP_NAMES = {
+    "run_analyses_3_30_300_analyses_3_30_300_get": "analyses_3_30_300",
+    "run_analyses_baf_analyses_baf__get": "analyses_baf",
+    "run_concept_aggregation_concept_aggregation_post": "concept_aggregation",
+    "get_single_task_concept_buffer_concept_buffer_get": "concept_buffer",
+    "get_task_concept_clip_concept_clip_get": "concept_clip",
+    "get_task_concept_closest_concept_closest_get": "concept_closest",
+    "run_concept_closest_concept_closest_post": "concept_closest_from_entity",
+    "get_task_concept_density_area_concept_density_area_get": "concept_density_area",
+    "run_concept_density_area_concept_density_area_post": "concept_density_area_from_entity",
+    "get_task_concept_density_count_concept_density_count_get": "concept_density_count",
+    "run_concept_density_count_concept_density_count_post": "concept_density_count_from_entity",
+    "run_concept_difference_area_concept_difference_area_post": "concept_difference_area",
+    "get_task_concept_overlay_concept_overlay_get": "concept_overlay",
+    "get_task_concept_sjoin_concept_sjoin_get": "concept_sjoin",
+    "get_task_concept_sjoin_nearest_concept_sjoin_nearest_get": "concept_sjoin_nearest",
+    "run_concept_shadow_modelling_concept_shadow_modelling_post": "concept_shadow_modelling",
+    "get_usages_summary_usage_summary_get": "usage_summary",
+    "post_geojson_source_geojson_source_geojson_post": "post_geojson",
+    "delete_task_task__task_id__delete": "delete_task",
+}
+
 SourceRegistry = dict[str, dict[str, dict[bool, str]]]
 
 SERVER_INSTRUCTIONS = """\
@@ -123,7 +156,20 @@ If a call fails with 401/403, run `whoami` first to confirm credentials.
 
 
 def _make_client(base_url: str, username: str, password: str) -> httpx.AsyncClient:
-    return httpx.AsyncClient(base_url=base_url, auth=httpx.BasicAuth(username, password))
+    # httpx's default timeout (5s across connect/read/write/pool) is too
+    # tight for this API: task-status polls, /result and /describe on large
+    # datasets, and delete_task have all been observed taking longer than
+    # 5s under normal (non-degraded) conditions. A request that merely runs
+    # long — not stuck — then raises httpx.TimeoutException, which every
+    # tool sharing this client (auto-generated ones included) surfaces as a
+    # bare "Upstream request timed out, please retry", even when the
+    # underlying task had already finished. 10s to establish a connection,
+    # 60s to receive a response, is generous without hanging indefinitely
+    # on a genuinely dead connection.
+    timeout = httpx.Timeout(10.0, read=60.0)
+    return httpx.AsyncClient(
+        base_url=base_url, auth=httpx.BasicAuth(username, password), timeout=timeout
+    )
 
 
 def _check_response(resp: httpx.Response) -> None:
@@ -309,6 +355,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         name="SignalEyes API",
         route_maps=route_maps,
         instructions=SERVER_INSTRUCTIONS,
+        mcp_names=MCP_NAMES,
     )
 
     @mcp.tool
@@ -323,21 +370,29 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         `Prefer: respond-async` header) return a task_id immediately instead
         of a result. This collapses the manual GET /task/{id} polling loop
         into one call instead of many separate tool round-trips.
+
+        A single slow request during polling doesn't fail the whole call —
+        it's retried on the next poll_interval tick, still bounded by
+        max_wait — since a transient timeout on one poll says nothing about
+        whether the task itself succeeded.
         """
         try:
             async with asyncio.timeout(max_wait):
                 while True:
-                    status_resp = await client.get(f"/task/{task_id}")
-                    _check_response(status_resp)
-                    status_body = status_resp.json()
-                    status = status_body["status"]
-                    if status == "done":
-                        result_resp = await client.get(f"/task/{task_id}/result")
-                        _check_response(result_resp)
-                        result: dict[str, Any] = result_resp.json()
-                        return result
-                    if status == "failed":
-                        raise RuntimeError(f"Task {task_id} failed: {status_body.get('error')}")
+                    try:
+                        status_resp = await client.get(f"/task/{task_id}")
+                        _check_response(status_resp)
+                        status_body = status_resp.json()
+                        status = status_body["status"]
+                        if status == "done":
+                            result_resp = await client.get(f"/task/{task_id}/result")
+                            _check_response(result_resp)
+                            result: dict[str, Any] = result_resp.json()
+                            return result
+                        if status == "failed":
+                            raise RuntimeError(f"Task {task_id} failed: {status_body.get('error')}")
+                    except httpx.TimeoutException:
+                        pass
                     await asyncio.sleep(poll_interval)
         except TimeoutError as exc:
             raise TimeoutError(f"Task {task_id} did not complete within {max_wait}s") from exc
@@ -468,6 +523,14 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         respond_async=True to have the API gather every page itself and
         hand back a `task_id` instead (feed that to `wait_for_task`).
 
+        Only want a count or attribute summary, not the features themselves?
+        Don't pull the full result to count it client-side — call this with
+        respond_async=True, then `manage_task(task_id, view="describe")`
+        instead of `wait_for_task`. describe returns feature counts and
+        per-attribute stats without the geometries, which for a query
+        returning thousands of features is the difference between a few KB
+        and a multi-MB result landing in context.
+
         See `list_source_entities` for valid `entity`/`variant` combinations.
         """
         path = f"/source/{entity}/{variant}" if variant else f"/source/{entity}"
@@ -535,7 +598,9 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
 
         Set respond_async=True for large AOIs — the API replies with a task
         ID immediately instead of gathering every page inline; resolve it
-        with wait_for_task.
+        with wait_for_task. Only want a count or attribute summary? Use
+        `manage_task(task_id, view="describe")` instead of wait_for_task —
+        see fetch_all_pages' docstring for why.
 
         Like the GET endpoint, results are paginated; the response carries
         `total_pages`/`page` (from the X-Total-Pages/X-Page-Number headers)

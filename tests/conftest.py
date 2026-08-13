@@ -6,21 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-
-
-def make_spec(paths: dict) -> dict:
-    return {"openapi": "3.0.0", "info": {"title": "test", "version": "1"}, "paths": paths}
-
-
-def op(operation_id: str, path_params: tuple[str, ...] = ()) -> dict:
-    return {
-        "operationId": operation_id,
-        "parameters": [
-            {"name": p, "in": "path", "required": True, "schema": {"type": "string"}}
-            for p in path_params
-        ],
-        "responses": {"200": {"description": "ok"}},
-    }
+from spec_helpers import make_spec, op
 
 
 @pytest.fixture
@@ -110,6 +96,7 @@ def spy_async_client(monkeypatch):
     def spying_init(self, *args, **kwargs):
         captured["base_url"] = kwargs.get("base_url")
         captured["auth"] = kwargs.get("auth")
+        captured["timeout"] = kwargs.get("timeout")
         real_init(self, *args, **kwargs)
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", spying_init)
@@ -121,13 +108,18 @@ def async_client_get_queue(monkeypatch):
     """Patch httpx.AsyncClient.get to pop pre-queued responses in call order.
 
     Tests append httpx.Response objects to `.responses` before invoking the
-    tool under test; `.calls` records each (url, params) pair made.
+    tool under test; `.calls` records each (url, params) pair made. An
+    Exception instance in the queue is raised instead of returned — used to
+    simulate a transient httpx timeout on one poll without ending the test.
     """
     state = SimpleNamespace(responses=[], calls=[])
 
     async def fake_get(self, url, params=None, headers=None, **kwargs):
         state.calls.append({"url": url, "params": params, "headers": headers})
-        return state.responses.pop(0)
+        next_item = state.responses.pop(0)
+        if isinstance(next_item, Exception):
+            raise next_item
+        return next_item
 
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
     return state
