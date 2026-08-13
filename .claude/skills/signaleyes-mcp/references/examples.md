@@ -23,11 +23,17 @@ That's it — a direct layer request doesn't need a concept tool at all.
 > "How many trees are in this area?"
 
 ```
-fetch_all_pages(entity="tree", polygon=aoi)
+task = fetch_all_pages(entity="tree", polygon=aoi, respond_async=True)["id"]
+manage_task(task, view="describe")
 ```
 
-Count the returned `features` yourself — there's no dedicated counting
-endpoint for a single-area raw count.
+Don't fetch the full `FeatureCollection` to count it client-side — for a
+few thousand features that's megabytes landing in context for one number.
+`describe` returns `number_of_features` (plus attribute stats you likely
+don't need here, but they're cheap) without the geometries. There's no
+dedicated "count only" endpoint upstream, but `describe` on an async task
+is the equivalent — see SKILL.md's async task pattern for why the fetch
+has to go through `respond_async=True` first.
 
 ## Proximity: trees within 15m of a road
 
