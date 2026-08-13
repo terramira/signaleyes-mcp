@@ -151,6 +151,20 @@ claude mcp add signaleyes-mcp \
   -- uv run --directory /path/to/signaleyes-mcp signaleyes-mcp
 ```
 
+Also copy `.claude/skills/signaleyes-mcp/` from this repo into your own
+project's `.claude/skills/` if you're using Claude Code. Tool schemas
+cover what each tool takes; the skill covers what they don't — the async
+`task_id` pattern almost every real call goes through, and reusable
+fetch → buffer → overlay/sjoin patterns for compound questions like "what's
+within N meters of X". A well-documented MCP server and a skill aren't
+either/or: MCP gives an agent *access*, a skill gives it *judgment* about
+how to use that access well — see [Anthropic's Agent Skills
+writeup](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
+for the general case. An unused skill costs only its `name`/`description`
+in context (~100 tokens) until Claude decides it's relevant, so adding one
+alongside a lean tool set — rather than instead of one — is the cheap
+option, not the expensive one.
+
 **GitHub Copilot CLI** — add to `~/.copilot/mcp-config.json`:
 
 ```json
