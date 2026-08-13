@@ -1,9 +1,16 @@
 """MCP server exposing NEO's SignalEyes API (SuperAPI) as tools.
 
-Turns https://api.neo.nl/v1's OpenAPI spec into MCP tools automatically via
-FastMCP.from_openapi — one call per HTTP operation, no hand-written wrappers.
-A few hand-written tools sit on top for things the spec can't express:
-task polling, header-driven pagination, and a credential check.
+Turns https://api.neo.nl/v1's OpenAPI spec into MCP tools via
+FastMCP.from_openapi. Most operations still get a tool generated
+automatically, but hand-written tools cover two kinds of gap: things the
+spec can't express at all (task polling, header-driven pagination,
+credential check), and — since the API's ~115 operations are mostly the same
+four shapes (query, id lookup, batch id lookup, metadata) repeated per
+source entity — the repeated shapes, which collapse into a handful of
+generic `entity`-parameterized tools instead of one MCP tool per entity. The
+entity/operation support matrix behind those generic tools is derived from
+the live spec at startup, not hand-typed, so it can't drift from what the
+API actually exposes.
 
 `uv run signaleyes-mcp` also supports two non-serving subcommands:
 `test` (runs the test suite) and `smoke` (runs one real query against the
@@ -14,6 +21,7 @@ import argparse
 import asyncio
 import os
 import random
+import re
 import sys
 from typing import Any
 
@@ -26,13 +34,20 @@ from fastmcp.server.providers.openapi import MCPType, RouteMap
 # vector tiles, DSM/DTM raster tiles (their openapi.json entry claims
 # application/json, but they actually return image/tiff — confirmed by
 # direct request, not just spec-reading), the shadow-modelling raster, and
-# the usage-records XLSX export. Everything else becomes a tool.
+# the usage-records XLSX export. /subscriptions and /token/* are excluded
+# for a different reason: /subscriptions just duplicates `whoami`, and the
+# /token/* endpoints issue OAuth2 bearer tokens this server never uses (the
+# shared httpx client always signs requests with HTTP Basic auth instead) —
+# calling them would hand the caller a token nothing else here can use.
+# Everything else becomes a tool.
 EXCLUDED_PATTERNS = (
     r"^/source/wfs/.*",
     r"^/source/tiles/.*",
     r"^/source/(dsm|dtm)(/pages)?(/\{quadkey\})?$",
     r"^/analyses/shadow_modelling$",
     r"^/usage/records$",
+    r"^/subscriptions$",
+    r"^/token/(generate|refresh|revoke)$",
 )
 
 # These POST /source/* endpoints declare their request body as a bare JSON
@@ -75,6 +90,37 @@ SMOKE_POLYGON = (
 )
 SMOKE_ENTITIES = ("building", "tree", "road", "water", "solarpanel")
 
+# Path parameter names that mean "sub-type of this entity" (e.g. a building
+# category, a landscape-element type, a third-party dataset identifier) as
+# opposed to a record id. Used to tell a /source/{entity} "list" route from
+# a /source/{entity}/{id} "single record" route while deriving the registry.
+_VARIANT_PARAM_NAMES = ("entity", "identifier")
+
+SourceRegistry = dict[str, dict[str, dict[bool, str]]]
+
+SERVER_INSTRUCTIONS = """\
+SignalEyes: geospatial data (buildings, trees, roads, water, solar panels, \
+...) plus chainable analytical concepts (density, closest, buffer, overlay, \
+sjoin, ...) over an area-of-interest polygon.
+
+Typical flow:
+1. Unsure which dataset/entity to use? Call `list_source_entities` — it
+   reflects whatever the live API currently exposes.
+2. Fetch data for a polygon: `fetch_all_pages` (or `post_large_polygon` for
+   polygons too big to fit a URL). Both can return data directly, or —
+   with respond_async=True — a `task_id` for a big/slow query.
+3. Look up specific records: `get_object_by_id`, `post_objects_by_ids`
+   (batch), or `get_objects_metadata` (field schema for an entity).
+4. Chain a concept onto completed fetches: POST /concept/* tools take an
+   entity + params and return a task_id; GET /concept/* tools combine two
+   already-fetched results via their task_ids (task_id_primary_entity /
+   task_id_secondary_entity).
+5. Any tool result containing a bare `task_id` needs `wait_for_task` (or
+   `manage_task`) before its data is usable — poll, don't guess.
+
+If a call fails with 401/403, run `whoami` first to confirm credentials.
+"""
+
 
 def _make_client(base_url: str, username: str, password: str) -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url=base_url, auth=httpx.BasicAuth(username, password))
@@ -102,17 +148,158 @@ def _check_response(resp: httpx.Response) -> None:
         raise
 
 
+def _is_excluded(path: str) -> bool:
+    return any(re.match(p, path) for p in EXCLUDED_PATTERNS)
+
+
+def _build_source_registry(spec: dict[str, Any]) -> tuple[SourceRegistry, list[str]]:
+    """Derive the /source/{entity} operation support matrix from the live spec.
+
+    Almost every /source/* path is one of four shapes: "list" (the polygon
+    query), "by_id" (.../{id}), "metadata" (.../metadata), or "batch"
+    (POST .../batch, id lookup). Some entities need a `variant` path segment
+    (e.g. /source/building/{entity}/...) and some don't, and which shapes
+    exist at all varies per entity (bag/district/neighborhood have no by_id
+    or batch; thirdparty has no bare list form; building/tree support both a
+    bare list and a variant one). Reading this straight from `spec["paths"]`
+    instead of hand-typing it means the generic tools below track whatever
+    the API currently exposes, the same guarantee the rest of this
+    auto-generated server already has.
+
+    Returns the registry (entity -> shape -> {variant_required: path
+    template, using the placeholder "{variant}"/"{id}"}), plus the literal
+    (non-normalized) list of GET "list" paths — used to exclude the
+    single-page auto-generated tools that `fetch_all_pages` already covers.
+    """
+    registry: SourceRegistry = {}
+    list_get_paths: list[str] = []
+    for path, path_item in spec.get("paths", {}).items():
+        if not path.startswith("/source/") or _is_excluded(path):
+            continue
+        segs = path.split("/")
+        last = segs[-1]
+        for method in path_item:
+            if method not in ("get", "post"):
+                continue
+            if last == "metadata":
+                shape = "metadata"
+            elif last == "batch" and method == "post":
+                shape = "batch"
+            elif (
+                last.startswith("{")
+                and last.strip("{}") not in _VARIANT_PARAM_NAMES
+                and method == "get"
+            ):
+                shape = "by_id"
+            elif method == "get":
+                shape = "list"
+                list_get_paths.append(path)
+            else:
+                continue
+
+            norm = ["{variant}" if s.strip("{}") in _VARIANT_PARAM_NAMES else s for s in segs]
+            entity_segs = norm[2:] if shape == "list" else norm[2:-1]
+            entity_key = "_".join(s for s in entity_segs if s != "{variant}").replace("-", "_")
+            requires_variant = "{variant}" in norm
+            registry.setdefault(entity_key, {}).setdefault(shape, {})[requires_variant] = "/".join(
+                norm
+            )
+    return registry, list_get_paths
+
+
+def _route_pattern(template: str) -> str:
+    """Turn a normalized registry template back into a RouteMap-matchable regex.
+
+    RouteMap.pattern matches against the spec's literal path template (e.g.
+    "/source/building/{entity}/{id}"), not a resolved URL — so the
+    normalized "{variant}" placeholder has to become a regex alternation
+    over the real param names it could stand for ({entity}/{identifier})
+    rather than being treated as literal text.
+    """
+    parts = [
+        r"\{(?:entity|identifier)\}" if seg == "{variant}" else re.escape(seg)
+        for seg in template.split("/")
+    ]
+    return "^" + "/".join(parts) + "$"
+
+
+def _resolve_source_path(
+    registry: SourceRegistry, entity: str, shape: str, variant: str | None, **path_kwargs: str
+) -> str:
+    templates = registry.get(entity, {}).get(shape)
+    if not templates:
+        supported = sorted(e for e, shapes in registry.items() if shape in shapes)
+        raise ValueError(f"{entity!r} has no {shape} endpoint. Entities that do: {supported}")
+    has_variant = variant is not None
+    if has_variant not in templates:
+        if has_variant:
+            raise ValueError(f"{entity!r}'s {shape} endpoint doesn't take a variant.")
+        raise ValueError(
+            f"{entity!r}'s {shape} endpoint requires a variant sub-type "
+            "(check get_objects_metadata or list_source_entities)."
+        )
+    return templates[has_variant].format(variant=variant, **path_kwargs)
+
+
+def _describe_source_registry(registry: SourceRegistry) -> dict[str, dict[str, str]]:
+    described: dict[str, dict[str, str]] = {}
+    for entity, shapes in sorted(registry.items()):
+        entry: dict[str, str] = {}
+        for shape in ("list", "by_id", "metadata", "batch"):
+            variants = shapes.get(shape)
+            if variants is None:
+                continue
+            if True in variants and False in variants:
+                entry[shape] = "variant optional"
+            elif True in variants:
+                entry[shape] = "variant required"
+            else:
+                entry[shape] = "no variant"
+        described[entity] = entry
+    return described
+
+
 def build_server(base_url: str, username: str, password: str) -> FastMCP:
     resp = httpx.get(f"{base_url}/openapi.json", timeout=30)
     resp.raise_for_status()
     spec = resp.json()
 
     client = _make_client(base_url, username, password)
+    source_registry, redundant_list_paths = _build_source_registry(spec)
 
     route_maps = [RouteMap(pattern=p, mcp_type=MCPType.EXCLUDE) for p in EXCLUDED_PATTERNS]
     route_maps.extend(
         RouteMap(pattern=p, methods=["POST"], mcp_type=MCPType.EXCLUDE)
         for p in _BROKEN_POLYGON_BODY_POST_PATTERNS
+    )
+    # /source/{entity}/{id}, /metadata, and POST .../batch for every entity
+    # collapse into get_object_by_id / get_objects_metadata /
+    # post_objects_by_ids below; the single-page GET query for every entity
+    # collapses into fetch_all_pages (which already covers it, page cap and
+    # all). Templates from the registry use the normalized "{variant}"
+    # placeholder, so route_pattern() maps it back to whichever real path
+    # param name ({entity} or {identifier}) the spec actually uses.
+    route_maps.extend(
+        RouteMap(pattern=rf"^{re.escape(p)}$", methods=["GET"], mcp_type=MCPType.EXCLUDE)
+        for p in redundant_list_paths
+    )
+    route_maps.extend(
+        RouteMap(pattern=_route_pattern(p), mcp_type=MCPType.EXCLUDE)
+        for shapes in source_registry.values()
+        for shape, variants in shapes.items()
+        if shape in ("by_id", "metadata", "batch")
+        for p in variants.values()
+    )
+    # GET-only: /task/{task_id}'s DELETE method (delete_task) stays its own
+    # tool — see manage_task's docstring for why deletion isn't folded in.
+    route_maps.extend(
+        RouteMap(pattern=p, methods=["GET"], mcp_type=MCPType.EXCLUDE)
+        for p in (
+            r"^/task/\{task_id\}$",
+            r"^/task/\{task_id\}/describe$",
+            r"^/task/\{task_id\}/metadata$",
+            r"^/task/\{task_id\}/result$",
+        )
     )
     route_maps.append(RouteMap(methods=["GET", "POST", "DELETE"], mcp_type=MCPType.TOOL))
 
@@ -121,6 +308,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         client=client,
         name="SignalEyes API",
         route_maps=route_maps,
+        instructions=SERVER_INSTRUCTIONS,
     )
 
     @mcp.tool
@@ -155,17 +343,113 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
             raise TimeoutError(f"Task {task_id} did not complete within {max_wait}s") from exc
 
     @mcp.tool
+    async def manage_task(task_id: str, view: str = "status") -> dict[str, Any]:
+        """Inspect a background task without deleting it.
+
+        view:
+          - "status" (default) — id/status/error. If still running, use
+            `wait_for_task` instead of polling this by hand.
+          - "result" — the completed task's data (409 if not done yet).
+          - "describe" — a statistical summary of the result (feature
+            counts, attributes) without pulling the full result into context.
+          - "metadata" — how the task was created (zoom, source entity,
+            geometry type, CRS, creation time).
+
+        Deletion is intentionally not a `view` here and has its own
+        `delete_task` tool instead — an MCP client that approves reads on
+        this tool shouldn't thereby approve deleting the task too.
+        """
+        views = {
+            "status": "",
+            "describe": "/describe",
+            "metadata": "/metadata",
+            "result": "/result",
+        }
+        if view not in views:
+            raise ValueError(f"view must be one of {sorted(views)}, got {view!r}")
+        resp = await client.get(f"/task/{task_id}{views[view]}")
+        _check_response(resp)
+        result: dict[str, Any] = resp.json()
+        return result
+
+    @mcp.tool
+    def list_source_entities() -> dict[str, dict[str, str]]:
+        """List every /source/{entity} dataset and which operations it supports.
+
+        Start here when unsure which `entity`/`variant` to pass to
+        `fetch_all_pages`, `post_large_polygon`, `get_object_by_id`,
+        `post_objects_by_ids`, or `get_objects_metadata` — this reflects
+        whatever the live API currently exposes, not a fixed list.
+
+        Returns, per entity, which of "list" (polygon query), "by_id",
+        "metadata", "batch" it supports, and whether that operation needs a
+        `variant` sub-type ("no variant" / "variant required" / "variant
+        optional" — optional means both a bare and a variant form exist).
+        """
+        return _describe_source_registry(source_registry)
+
+    @mcp.tool
+    async def get_object_by_id(
+        entity: str, object_id: str, variant: str | None = None
+    ) -> dict[str, Any]:
+        """Fetch one /source/{entity} object by id (a FeatureCollection with one feature).
+
+        See `list_source_entities` for which entities support this and
+        whether `variant` is required (e.g. entity="building" needs a
+        variant like "school"; entity="water" takes none at all).
+        """
+        path = _resolve_source_path(source_registry, entity, "by_id", variant, id=object_id)
+        resp = await client.get(path)
+        _check_response(resp)
+        result: dict[str, Any] = resp.json()
+        return result
+
+    @mcp.tool
+    async def post_objects_by_ids(
+        entity: str, ids: list[str], variant: str | None = None
+    ) -> dict[str, Any]:
+        """Batch-fetch up to 100 /source/{entity} objects by id in one call.
+
+        All ids must fall within the caller's area of interest — if any are
+        outside it or don't exist, the whole request fails listing the bad
+        ids. See `list_source_entities` for which entities support batch
+        lookup and whether they need `variant`.
+        """
+        path = _resolve_source_path(source_registry, entity, "batch", variant)
+        resp = await client.post(path, json={"ids": ids})
+        _check_response(resp)
+        result: dict[str, Any] = resp.json()
+        return result
+
+    @mcp.tool
+    async def get_objects_metadata(entity: str, variant: str | None = None) -> dict[str, Any]:
+        """Fetch the field/schema metadata for a /source/{entity} dataset.
+
+        Check this before querying an unfamiliar entity, to see its real
+        attribute names instead of guessing what goes in `filter_string`.
+        See `list_source_entities` for which entities need `variant`.
+        """
+        path = _resolve_source_path(source_registry, entity, "metadata", variant)
+        resp = await client.get(path)
+        _check_response(resp)
+        result: dict[str, Any] = resp.json()
+        return result
+
+    @mcp.tool
     async def fetch_all_pages(
         entity: str,
         polygon: str,
         variant: str | None = None,
-        max_pages: int = 50,
+        max_pages: int = 10,
         filter_string: str | None = None,
         geo_type: str | None = None,
         simplify: float | None = None,
         sample: float | None = None,
         dissolve: bool | None = None,
         intersect_centroid: bool | None = None,
+        attributes: str | None = None,
+        groupby: str | None = None,
+        respond_async: bool = False,
     ) -> dict[str, Any]:
         """Fetch every page of a GET /source/{entity} query and merge into one FeatureCollection.
 
@@ -173,9 +457,18 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         auto-generated per-endpoint tools can't see (they only surface the
         JSON body) — so fetching a multi-page area otherwise takes one tool
         call per page, driven by trial and error. This does it in one call,
-        while still supporting the same filters as the single-page tool
-        (filter_string, geo_type, simplify, sample, dissolve,
-        intersect_centroid) so pagination and filtering aren't a trade-off.
+        while still supporting the same filters as the API's single-page
+        query (filter_string, geo_type, simplify, sample, dissolve,
+        intersect_centroid, attributes/groupby — the last two only apply to
+        entity="thirdparty").
+
+        `max_pages` defaults low (10, not "all") so an unexpectedly large
+        area doesn't flood your context with features — raise it
+        explicitly once you know the area is small, or set
+        respond_async=True to have the API gather every page itself and
+        hand back a `task_id` instead (feed that to `wait_for_task`).
+
+        See `list_source_entities` for valid `entity`/`variant` combinations.
         """
         path = f"/source/{entity}/{variant}" if variant else f"/source/{entity}"
         extra_params: dict[str, Any] = {
@@ -185,8 +478,20 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
             "sample": sample,
             "dissolve": dissolve,
             "intersect_centroid": intersect_centroid,
+            "attributes": attributes,
+            "groupby": groupby,
         }
         extra_params = {k: v for k, v in extra_params.items() if v is not None}
+
+        if respond_async:
+            resp = await client.get(
+                path,
+                params={"polygon": polygon, **extra_params},
+                headers={"Prefer": "respond-async"},
+            )
+            _check_response(resp)
+            async_result: dict[str, Any] = resp.json()
+            return async_result
 
         features: list[dict[str, Any]] = []
         page = 1
@@ -234,10 +539,8 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
 
         Like the GET endpoint, results are paginated; the response carries
         `total_pages`/`page` (from the X-Total-Pages/X-Page-Number headers)
-        so the caller knows whether to fetch more with `page=2`, etc. Covers
-        every entity/variant reachable as /source/{entity}[/{variant}]
-        except /source/building/inactive/{entity} (three path segments,
-        outside this tool's scheme — same gap fetch_all_pages already has).
+        so the caller knows whether to fetch more with `page=2`, etc.
+        See `list_source_entities` for valid `entity`/`variant` combinations.
         """
         path = f"/source/{entity}/{variant}" if variant else f"/source/{entity}"
         params: dict[str, Any] = {
