@@ -6,21 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-
-
-def make_spec(paths: dict) -> dict:
-    return {"openapi": "3.0.0", "info": {"title": "test", "version": "1"}, "paths": paths}
-
-
-def op(operation_id: str, path_params: tuple[str, ...] = ()) -> dict:
-    return {
-        "operationId": operation_id,
-        "parameters": [
-            {"name": p, "in": "path", "required": True, "schema": {"type": "string"}}
-            for p in path_params
-        ],
-        "responses": {"200": {"description": "ok"}},
-    }
+from spec_helpers import make_spec, op
 
 
 @pytest.fixture

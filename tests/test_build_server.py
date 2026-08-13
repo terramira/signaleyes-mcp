@@ -4,7 +4,7 @@ import asyncio
 
 import httpx
 import pytest
-from conftest import make_spec, op
+from spec_helpers import make_spec, op
 
 from signaleyes_mcp import build_server
 from signaleyes_mcp.server import MCP_NAMES
@@ -200,15 +200,18 @@ def test_client_uses_a_longer_than_default_timeout(mock_spec_get, spy_async_clie
     assert timeout.read == 60.0
 
 
-def test_mcp_names_shortens_auto_generated_concept_tool_names(monkeypatch, spy_async_client):
+def test_mcp_names_shortens_every_mapped_operation(monkeypatch, spy_async_client):
     """Concept/analyses/task/geojson tools stay auto-generated, but FastMCP's
     default name is the raw operationId — FastAPI's, in particular, repeat the
-    function name and path. Build a spec using one real long operationId (rather
-    than the short synthetic ones the shared fake_spec fixture uses) and confirm
-    it comes out mapped to MCP_NAMES' short name, not the raw one."""
-    long_operation_id = "get_task_concept_overlay_concept_overlay_get"
-    assert MCP_NAMES[long_operation_id] == "concept_overlay"
-    spec = make_spec({"/concept/overlay": {"get": op(long_operation_id)}})
+    function name and path. Build a spec covering every real long operationId
+    MCP_NAMES maps (rather than the short synthetic ones the shared fake_spec
+    fixture uses) and confirm each comes out as its mapped short name. Covers
+    every entry, not just one, since MCP_NAMES is hand-maintained — a
+    stale/typo'd key silently falls back to the raw, unshortened name instead
+    of erroring, so only exercising the whole mapping catches that in CI."""
+    spec = make_spec(
+        {f"/synthetic/{i}": {"get": op(long_id)} for i, long_id in enumerate(MCP_NAMES)}
+    )
 
     def fake_get(url, timeout=None):
         request = httpx.Request("GET", url)
@@ -217,9 +220,10 @@ def test_mcp_names_shortens_auto_generated_concept_tool_names(monkeypatch, spy_a
     monkeypatch.setattr(httpx, "get", fake_get)
 
     server = build_server("https://example.test/v1", "user", "pass")
-    names = _tool_names(server)
-    assert "concept_overlay" in names
-    assert long_operation_id not in names
+    names = set(_tool_names(server))
+    for long_id, short_name in MCP_NAMES.items():
+        assert short_name in names, f"{long_id} -> {short_name} did not take effect"
+        assert long_id not in names, f"{long_id} leaked through unshortened"
 
 
 def test_returns_fastmcp_server_named_signaleyes(mock_spec_get, spy_async_client):
