@@ -62,6 +62,15 @@ def fake_spec() -> dict:
             "/source/agriparcel/{id}": {"get": op("get_agriparcel_by_id", ("id",))},
             "/source/agriparcel/metadata": {"get": op("get_agriparcel_metadata")},
             "/source/agriparcel/batch": {"post": op("post_agriparcel_batch")},
+            "/source/bag": {"get": op("get_bag"), "post": op("post_bag")},
+            "/source/tree": {"get": op("get_tree"), "post": op("post_tree")},
+            "/source/tree/{entity}": {
+                "get": op("get_tree_entity", ("entity",)),
+                "post": op("post_tree_entity", ("entity",)),
+            },
+            "/source/thirdparty/{identifier}": {
+                "get": op("get_thirdparty", ("identifier",)),
+            },
             "/task/{task_id}": {
                 "get": op("get_task", ("task_id",)),
                 "delete": op("delete_task", ("task_id",)),
@@ -97,6 +106,7 @@ def spy_async_client(monkeypatch):
         captured["base_url"] = kwargs.get("base_url")
         captured["auth"] = kwargs.get("auth")
         captured["timeout"] = kwargs.get("timeout")
+        captured["transport"] = kwargs.get("transport")
         real_init(self, *args, **kwargs)
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", spying_init)

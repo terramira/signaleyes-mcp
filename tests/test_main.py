@@ -75,6 +75,22 @@ def test_explicit_serve_subcommand_behaves_like_no_args(clean_env, monkeypatch):
     fake_server.run.assert_called_once_with()
 
 
+def test_http_transport_passes_host_and_port(clean_env, monkeypatch):
+    monkeypatch.setenv("SIGNALEYES_USERNAME", "user")
+    monkeypatch.setenv("SIGNALEYES_PASSWORD", "pw")
+
+    fake_server = MagicMock()
+    fake_build = MagicMock(return_value=fake_server)
+    monkeypatch.setattr(signaleyes_mcp, "build_server", fake_build)
+
+    signaleyes_mcp.main(["serve", "--transport", "http", "--host", "0.0.0.0", "--port", "9001"])
+
+    fake_build.assert_called_once_with("https://api.neo.nl/v1", "user", "pw")
+    fake_server.run.assert_called_once_with(
+        transport="http", host="0.0.0.0", port=9001, stateless_http=True
+    )
+
+
 def test_success_uses_custom_base_url(clean_env, monkeypatch):
     monkeypatch.setenv("SIGNALEYES_USERNAME", "user")
     monkeypatch.setenv("SIGNALEYES_PASSWORD", "pw")

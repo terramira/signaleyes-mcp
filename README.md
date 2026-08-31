@@ -148,6 +148,7 @@ this is what an MCP client actually launches):
 
 ```bash
 uv run signaleyes-mcp            # serve over stdio (default)
+uv run signaleyes-mcp serve --transport http --port 8000
 uv run signaleyes-mcp test       # run the test suite (uv run pytest, equivalently)
 uv run signaleyes-mcp smoke      # one real query against SignalEyes, to sanity-check credentials/setup
 uv run signaleyes-mcp smoke --entity tree --polygon "POLYGON ((...))"
@@ -184,6 +185,62 @@ claude mcp add signaleyes-mcp \
 }
 ```
 
+## Orchestrator / multi-agent use
+
+This server is meant to be one specialist in an agent orchestrator, not a
+chatbot with 90+ near-duplicate tools.
+
+**stdio** — one client, one process (Claude Code, Copilot, a single worker).
+
+**Streamable HTTP** — several agents sharing one server:
+
+```bash
+uv run signaleyes-mcp serve --transport http --host 127.0.0.1 --port 8000
+```
+
+Then point workers at `http://127.0.0.1:8000/mcp`. HTTP runs **stateless**
+(no session affinity), so concurrent workers can share one process. In Python:
+
+```python
+from signaleyes_mcp import bind, call_tool, call_tools, connect
+
+async with connect("http://127.0.0.1:8000/mcp") as client:
+    skill, tools = await bind(client)  # load this before the first tool call
+    entities = await call_tool(client, "list_source_entities", {})
+    if not entities.ok:
+        # entities.retryable / entities.hint tell the agent whether to retry
+        ...
+    # independent reads can fan out:
+    pages = await call_tools(client, [
+        ("get_objects_metadata", {"entity": "tree"}),
+        ("get_objects_metadata", {"entity": "building"}),
+    ])
+```
+
+`call_tool` returns a `ToolOutcome` (`ok`, `data`, `error`, `retryable`,
+`hint`) instead of raising on a 4xx/5xx from the API — the specialist agent
+can put that back in context and recover. FastMCP already injects W3C
+`traceparent` into MCP `_meta`, so a Langfuse/OpenTelemetry span on the
+orchestrator links to this server's spans. Configure an OTEL exporter in the
+orchestrator process (no extra dependency here), for example Langfuse's
+OTLP endpoint.
+
+`bind` is the current pattern for teaching a specialist agent the workflow
+without stuffing it into every tool schema: discover → fetch or describe →
+wait for tasks → chain GET concepts. The same text is also exposed as MCP
+resource `skill://signaleyes/SKILL.md`. Tool errors include a recovery hint
+(401 → `whoami`; 422 → fix args, don't retry; POST 502 → don't re-fire,
+check `manage_task`).
+
+Large GeoJSON is truncated at `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES`
+(default 400_000). For counts/stats use `respond_async=True` then
+`manage_task(view="describe")` instead of pulling geometries. Transient
+GET 429/502/503/504 and connect failures are retried on the HTTP client;
+POST 502 is not, so a concept/task create is not double-fired.
+
+Read-only tools advertise `readOnlyHint`; `delete_task` advertises
+`destructiveHint`, so an orchestrator can allowlist the former.
+
 ## Configuration
 
 | Env var | Required | Default |
@@ -191,6 +248,7 @@ claude mcp add signaleyes-mcp \
 | `SIGNALEYES_USERNAME` | yes | — |
 | `SIGNALEYES_PASSWORD` | yes | — |
 | `SIGNALEYES_BASE_URL` | no | `https://api.neo.nl/v1` |
+| `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES` | no | `400000` (set `0` to disable truncation) |
 
 Set `SIGNALEYES_BASE_URL=https://api-dev.neo.nl/v1` to point at the dev
 environment instead.

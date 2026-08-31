@@ -129,6 +129,35 @@ def test_wait_for_task_retries_a_timeout_on_the_result_fetch_too(
     assert result.structured_content["features"] == [{"id": 1}]
 
 
+def test_wait_for_task_retries_past_a_503(
+    mock_spec_get, spy_async_client, async_client_get_queue, fast_sleep
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.extend(
+        [
+            _response(status_code=503, json={"detail": "unavailable"}),
+            _response(json={"id": "t1", "status": "done", "error": None}),
+            _response(json={"type": "FeatureCollection", "features": [{"id": 1}]}),
+        ]
+    )
+
+    result = _call(server, "wait_for_task", {"task_id": "t1"})
+
+    assert result.structured_content["features"] == [{"id": 1}]
+
+
+def test_wait_for_task_does_not_retry_a_422(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(status_code=422, json={"detail": "bad task id"})
+    )
+
+    with pytest.raises(ToolError, match="bad task id"):
+        _call(server, "wait_for_task", {"task_id": "t1"})
+
+
 # --- fetch_all_pages ---------------------------------------------------------
 
 
@@ -211,6 +240,13 @@ def test_fetch_all_pages_uses_variant_path(mock_spec_get, spy_async_client, asyn
     )
 
     assert async_client_get_queue.calls[0]["url"] == "/source/tree/crown"
+
+
+def test_fetch_all_pages_unknown_entity_raises(mock_spec_get, spy_async_client):
+    server = _server(mock_spec_get, spy_async_client)
+
+    with pytest.raises(ToolError, match="no list endpoint"):
+        _call(server, "fetch_all_pages", {"entity": "nope", "polygon": "POLYGON ((0 0))"})
 
 
 def test_fetch_all_pages_caps_at_max_pages(mock_spec_get, spy_async_client, async_client_get_queue):

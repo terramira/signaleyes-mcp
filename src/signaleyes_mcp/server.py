@@ -23,12 +23,17 @@ import os
 import random
 import re
 import sys
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal, Never
 
 import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.providers.openapi import MCPType, RouteMap
+from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddleware
+from fastmcp.server.providers.openapi import MCPType, OpenAPITool, RouteMap
+from fastmcp.server.providers.skills import SkillProvider
+from fastmcp.utilities.openapi import HTTPRoute
+from mcp.types import ToolAnnotations
 
 # Binary/XML endpoints an LLM tool call can't usefully consume: raw OGC WFS,
 # vector tiles, DSM/DTM raster tiles (their openapi.json entry claims
@@ -130,11 +135,34 @@ MCP_NAMES = {
 }
 
 SourceRegistry = dict[str, dict[str, dict[bool, str]]]
+TransportName = Literal["stdio", "http"]
+
+_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+_DEFAULT_MAX_RESPONSE_BYTES = 400_000
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_SAFE_RETRY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+_READ_OPEN = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+)
+_READ_LOCAL = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_WRITE_OPEN = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
+_DESTRUCTIVE_OPEN = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True
+)
 
 SERVER_INSTRUCTIONS = """\
 SignalEyes: geospatial data (buildings, trees, roads, water, solar panels, \
 ...) plus chainable analytical concepts (density, closest, buffer, overlay, \
 sjoin, ...) over an area-of-interest polygon.
+
+Read resource skill://signaleyes/SKILL.md before the first tool call — it is
+the workflow for this API (when to fetch vs describe, GET vs POST concepts,
+the geojson_list quirk).
 
 Typical flow:
 1. Unsure which dataset/entity to use? Call `list_source_entities` — it
@@ -152,7 +180,81 @@ Typical flow:
    `manage_task`) before its data is usable — poll, don't guess.
 
 If a call fails with 401/403, run `whoami` first to confirm credentials.
+Only want counts/stats, not geometries? `manage_task(view="describe")`
+instead of pulling the full FeatureCollection into context.
 """
+
+
+def _retryable_status(method: str, status_code: int) -> bool:
+    """GET-family 429/5xx-gateway, plus POST 429 (rate limit, typically not processed).
+
+    POST 502/503/504 is not retried: the API may already have created a task.
+    """
+    if status_code == 429:
+        return True
+    return status_code in _RETRYABLE_STATUSES and method.upper() in _SAFE_RETRY_METHODS
+
+
+def _retry_delay(attempt: int, backoff: float = 0.4) -> float:
+    """Exponential backoff with jitter so concurrent agents don't retry in lockstep."""
+    return float(backoff * (2**attempt) * (0.5 + random.random()))
+
+
+def _recovery_hint(status_code: int, method: str) -> str | None:
+    if status_code in (401, 403):
+        return "Call whoami once; do not retry other tools until credentials work."
+    if status_code == 422:
+        return "Fix the arguments; do not retry the same call."
+    if status_code == 429:
+        return "Rate limited. Wait, then retry."
+    if status_code == 409:
+        return "Task is not done yet. Use wait_for_task."
+    if status_code in (502, 503, 504) and method.upper() not in _SAFE_RETRY_METHODS:
+        return "Do not retry this POST (a task may already exist). Check manage_task."
+    return None
+
+
+class _RetryTransport(httpx.AsyncBaseTransport):
+    """Connect retries via httpx, plus a few idempotent status retries."""
+
+    def __init__(self, retries: int = 3, backoff: float = 0.4) -> None:
+        self._inner = httpx.AsyncHTTPTransport(retries=retries)
+        self._retries = retries
+        self._backoff = backoff
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response: httpx.Response | None = None
+        for attempt in range(self._retries + 1):
+            response = await self._inner.handle_async_request(request)
+            if attempt == self._retries or not _retryable_status(
+                request.method, response.status_code
+            ):
+                return response
+            await response.aclose()
+            await asyncio.sleep(_retry_delay(attempt, self._backoff))
+        assert response is not None
+        return response
+
+
+def _annotate_openapi_component(route: HTTPRoute, component: object) -> None:
+    """Mark generated tools so an orchestrator can allowlist reads vs deletes."""
+    if not isinstance(component, OpenAPITool):
+        return
+    method = route.method.upper()
+    if method == "GET":
+        component.annotations = _READ_OPEN
+    elif method == "DELETE":
+        component.annotations = _DESTRUCTIVE_OPEN
+    elif method == "POST":
+        component.annotations = _WRITE_OPEN
+
+
+def _max_response_bytes() -> int:
+    raw = os.environ.get("SIGNALEYES_MAX_TOOL_RESPONSE_BYTES", str(_DEFAULT_MAX_RESPONSE_BYTES))
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_MAX_RESPONSE_BYTES
 
 
 def _make_client(base_url: str, username: str, password: str) -> httpx.AsyncClient:
@@ -168,7 +270,10 @@ def _make_client(base_url: str, username: str, password: str) -> httpx.AsyncClie
     # on a genuinely dead connection.
     timeout = httpx.Timeout(10.0, read=60.0)
     return httpx.AsyncClient(
-        base_url=base_url, auth=httpx.BasicAuth(username, password), timeout=timeout
+        base_url=base_url,
+        auth=httpx.BasicAuth(username, password),
+        timeout=timeout,
+        transport=_RetryTransport(),
     )
 
 
@@ -187,9 +292,15 @@ def _check_response(resp: httpx.Response) -> None:
             detail = resp.json().get("detail")
         except ValueError:
             pass
+        hint = _recovery_hint(resp.status_code, exc.request.method)
+        parts = [str(exc)]
         if detail:
+            parts.append(str(detail))
+        if hint:
+            parts.append(hint)
+        if detail or hint:
             raise httpx.HTTPStatusError(
-                f"{exc} — {detail}", request=exc.request, response=exc.response
+                " — ".join(parts), request=exc.request, response=exc.response
             ) from exc
         raise
 
@@ -356,9 +467,22 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         route_maps=route_maps,
         instructions=SERVER_INSTRUCTIONS,
         mcp_names=MCP_NAMES,
+        mcp_component_fn=_annotate_openapi_component,
     )
+    mcp.add_provider(SkillProvider(_SKILLS_DIR / "signaleyes"))
+    max_bytes = _max_response_bytes()
+    if max_bytes > 0:
+        mcp.add_middleware(
+            ResponseLimitingMiddleware(
+                max_size=max_bytes,
+                truncation_suffix=(
+                    "\n\n[truncated at size cap. Use respond_async=True then "
+                    "manage_task(view='describe') instead of pulling full geometries.]"
+                ),
+            )
+        )
 
-    @mcp.tool
+    @mcp.tool(annotations=_READ_OPEN)
     async def wait_for_task(
         task_id: str,
         max_wait: float = 120.0,
@@ -391,13 +515,16 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
                             return result
                         if status == "failed":
                             raise RuntimeError(f"Task {task_id} failed: {status_body.get('error')}")
-                    except httpx.TimeoutException:
+                    except (httpx.TimeoutException, httpx.NetworkError):
                         pass
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code not in _RETRYABLE_STATUSES:
+                            raise
                     await asyncio.sleep(poll_interval)
         except TimeoutError as exc:
             raise TimeoutError(f"Task {task_id} did not complete within {max_wait}s") from exc
 
-    @mcp.tool
+    @mcp.tool(annotations=_READ_OPEN)
     async def manage_task(task_id: str, view: str = "status") -> dict[str, Any]:
         """Inspect a background task without deleting it.
 
@@ -427,7 +554,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         result: dict[str, Any] = resp.json()
         return result
 
-    @mcp.tool
+    @mcp.tool(annotations=_READ_LOCAL)
     def list_source_entities() -> dict[str, dict[str, str]]:
         """List every /source/{entity} dataset and which operations it supports.
 
@@ -443,7 +570,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         """
         return _describe_source_registry(source_registry)
 
-    @mcp.tool
+    @mcp.tool(annotations=_READ_OPEN)
     async def get_object_by_id(
         entity: str, object_id: str, variant: str | None = None
     ) -> dict[str, Any]:
@@ -459,7 +586,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         result: dict[str, Any] = resp.json()
         return result
 
-    @mcp.tool
+    @mcp.tool(annotations=_READ_OPEN)
     async def post_objects_by_ids(
         entity: str, ids: list[str], variant: str | None = None
     ) -> dict[str, Any]:
@@ -476,7 +603,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         result: dict[str, Any] = resp.json()
         return result
 
-    @mcp.tool
+    @mcp.tool(annotations=_READ_OPEN)
     async def get_objects_metadata(entity: str, variant: str | None = None) -> dict[str, Any]:
         """Fetch the field/schema metadata for a /source/{entity} dataset.
 
@@ -490,7 +617,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         result: dict[str, Any] = resp.json()
         return result
 
-    @mcp.tool
+    @mcp.tool(annotations=_READ_OPEN)
     async def fetch_all_pages(
         entity: str,
         polygon: str,
@@ -533,7 +660,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
 
         See `list_source_entities` for valid `entity`/`variant` combinations.
         """
-        path = f"/source/{entity}/{variant}" if variant else f"/source/{entity}"
+        path = _resolve_source_path(source_registry, entity, "list", variant)
         extra_params: dict[str, Any] = {
             "filter_string": filter_string,
             "geo_type": geo_type,
@@ -572,7 +699,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
             "pages_fetched": min(total_pages, max_pages),
         }
 
-    @mcp.tool
+    @mcp.tool(annotations=_WRITE_OPEN)
     async def post_large_polygon(
         entity: str,
         polygon: str,
@@ -607,7 +734,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         so the caller knows whether to fetch more with `page=2`, etc.
         See `list_source_entities` for valid `entity`/`variant` combinations.
         """
-        path = f"/source/{entity}/{variant}" if variant else f"/source/{entity}"
+        path = _resolve_source_path(source_registry, entity, "list", variant)
         params: dict[str, Any] = {
             "filter_string": filter_string,
             "page": page,
@@ -628,7 +755,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
             result["page"] = int(resp.headers.get("X-Page-Number", page))
         return result
 
-    @mcp.tool
+    @mcp.tool(annotations=_READ_OPEN)
     async def whoami() -> dict[str, Any]:
         """Check SignalEyes credentials by fetching the caller's active subscriptions."""
         resp = await client.get("/subscriptions")
@@ -676,10 +803,30 @@ def run_tests() -> int:
     return result
 
 
+def _run_server(server: FastMCP, transport: TransportName, host: str, port: int) -> None:
+    match transport:
+        case "stdio":
+            server.run()
+        case "http":
+            # ponytail: stateless HTTP — no session affinity, concurrent orchestrator workers
+            server.run(transport="http", host=host, port=port, stateless_http=True)
+        case _:
+            unreachable: Never = transport
+            raise ValueError(f"unknown transport: {unreachable}")
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="signaleyes-mcp")
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("serve", help="Run the MCP server over stdio (default)")
+    serve = sub.add_parser("serve", help="Run the MCP server (stdio default, or streamable HTTP)")
+    serve.add_argument(
+        "--transport",
+        choices=("stdio", "http"),
+        default="stdio",
+        help="stdio for a single MCP client; http for a shared orchestrator endpoint",
+    )
+    serve.add_argument("--host", default="127.0.0.1", help="Bind address (http transport only)")
+    serve.add_argument("--port", type=int, default=8000, help="Bind port (http transport only)")
     sub.add_parser("test", help="Run the test suite")
     smoke = sub.add_parser(
         "smoke", help="Run one real query against SignalEyes to check the setup works"
@@ -719,7 +866,19 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     server = build_server(base_url, username, password)
-    server.run()
+    raw_transport = getattr(args, "transport", "stdio")
+    if raw_transport == "http":
+        transport: TransportName = "http"
+    elif raw_transport == "stdio":
+        transport = "stdio"
+    else:
+        raise ValueError(f"unknown transport: {raw_transport}")
+    _run_server(
+        server,
+        transport,
+        getattr(args, "host", "127.0.0.1"),
+        getattr(args, "port", 8000),
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

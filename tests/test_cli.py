@@ -31,9 +31,14 @@ def test_no_args_means_no_command():
     assert args.command is None
 
 
-def test_serve_is_a_valid_subcommand():
-    args = _build_arg_parser().parse_args(["serve"])
+def test_serve_http_transport_args():
+    args = _build_arg_parser().parse_args(
+        ["serve", "--transport", "http", "--host", "0.0.0.0", "--port", "9000"]
+    )
     assert args.command == "serve"
+    assert args.transport == "http"
+    assert args.host == "0.0.0.0"
+    assert args.port == 9000
 
 
 def test_test_is_a_valid_subcommand():
@@ -135,10 +140,11 @@ def test_check_response_passes_through_on_success():
     _check_response(_response(200, json={"ok": True}))  # must not raise
 
 
-def test_check_response_includes_detail_from_json_body():
+def test_check_response_includes_detail_and_recovery_hint():
     resp = _response(422, json={"detail": "polygon must be in EPSG:4326"})
-    with pytest.raises(httpx.HTTPStatusError, match="polygon must be in EPSG:4326"):
+    with pytest.raises(httpx.HTTPStatusError, match="polygon must be in EPSG:4326") as exc:
         _check_response(resp)
+    assert "Fix the arguments" in str(exc.value)
 
 
 def test_check_response_falls_back_when_body_is_not_json():
@@ -147,3 +153,40 @@ def test_check_response_falls_back_when_body_is_not_json():
     )
     with pytest.raises(httpx.HTTPStatusError):
         _check_response(resp)
+
+
+def test_check_response_auth_hint_on_401():
+    resp = _response(401, json={"detail": "invalid credentials"})
+    with pytest.raises(httpx.HTTPStatusError, match="whoami"):
+        _check_response(resp)
+
+
+def test_retryable_status_retries_get_gateway_errors_and_any_429():
+    from signaleyes_mcp.server import _retryable_status
+
+    assert _retryable_status("GET", 429)
+    assert _retryable_status("GET", 500)
+    assert _retryable_status("GET", 502)
+    assert _retryable_status("POST", 429)
+    assert not _retryable_status("POST", 500)
+    assert not _retryable_status("POST", 502)
+    assert not _retryable_status("GET", 400)
+
+
+def test_retry_delay_stays_within_jitter_band():
+    from signaleyes_mcp.server import _retry_delay
+
+    delays = [_retry_delay(1, backoff=0.4) for _ in range(40)]
+    # attempt 1, backoff 0.4 → 0.8 * [0.5, 1.5) = [0.4, 1.2)
+    assert all(0.4 <= d < 1.2 for d in delays)
+    assert min(delays) != max(delays)
+
+
+def test_recovery_hint_covers_409_429_and_post_502():
+    from signaleyes_mcp.server import _recovery_hint
+
+    assert "wait_for_task" in (_recovery_hint(409, "GET") or "")
+    assert "Rate limited" in (_recovery_hint(429, "GET") or "")
+    assert "manage_task" in (_recovery_hint(502, "POST") or "")
+    assert _recovery_hint(502, "GET") is None
+    assert _recovery_hint(200, "GET") is None

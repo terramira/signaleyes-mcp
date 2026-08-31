@@ -239,6 +239,7 @@ def test_server_has_workflow_instructions(mock_spec_get, spy_async_client):
     assert server.instructions
     assert "list_source_entities" in server.instructions
     assert "wait_for_task" in server.instructions
+    assert "skill://signaleyes/SKILL.md" in server.instructions
 
 
 def test_spec_fetch_http_error_propagates(monkeypatch):
@@ -250,3 +251,30 @@ def test_spec_fetch_http_error_propagates(monkeypatch):
 
     with pytest.raises(httpx.HTTPStatusError):
         build_server("https://example.test/v1", "user", "pass")
+
+
+def test_client_uses_retry_transport(mock_spec_get, spy_async_client):
+    from signaleyes_mcp.server import _RetryTransport
+
+    build_server("https://example.test/v1", "user", "pass")
+    assert isinstance(spy_async_client["transport"], _RetryTransport)
+
+
+def test_exposes_signaleyes_skill_resource(mock_spec_get, spy_async_client):
+    server = build_server("https://example.test/v1", "user", "pass")
+    resources = asyncio.run(server.list_resources())
+    uris = [str(r.uri) for r in resources]
+    assert any(u.startswith("skill://signaleyes/") for u in uris)
+
+
+def test_tools_carry_read_vs_destructive_annotations(mock_spec_get, spy_async_client):
+    server = build_server("https://example.test/v1", "user", "pass")
+    tools = {t.name: t for t in asyncio.run(server.list_tools())}
+
+    assert tools["list_source_entities"].annotations is not None
+    assert tools["list_source_entities"].annotations.readOnlyHint is True
+    assert tools["list_source_entities"].annotations.openWorldHint is False
+    assert tools["fetch_all_pages"].annotations.readOnlyHint is True
+    assert tools["post_large_polygon"].annotations.readOnlyHint is False
+    assert tools["delete_task"].annotations is not None
+    assert tools["delete_task"].annotations.destructiveHint is True
