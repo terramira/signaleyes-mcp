@@ -9,6 +9,12 @@ import pytest
 from spec_helpers import make_spec, op
 
 
+@pytest.fixture(autouse=True)
+def no_spec_cache(monkeypatch):
+    """Tests mock httpx.get; an on-disk spec cache would bypass that mock."""
+    monkeypatch.setenv("SIGNALEYES_SPEC_CACHE", "")
+
+
 @pytest.fixture
 def fake_spec() -> dict:
     """A small spec covering every route-map branch build_server has to handle.
@@ -70,6 +76,16 @@ def fake_spec() -> dict:
             },
             "/source/thirdparty/{identifier}": {
                 "get": op("get_thirdparty", ("identifier",)),
+            },
+            "/source/thirdparty/{identifier}/arrow": {
+                "get": op("get_thirdparty_arrow", ("identifier",)),
+            },
+            "/concept/closest": {
+                "get": op(
+                    "get_task_concept_closest_concept_closest_get",
+                    description="Find closest.\n\nThe data is delivered in pages.\n\nFetch all.",
+                ),
+                "post": op("post_closest"),
             },
             "/task/{task_id}": {
                 "get": op("get_task", ("task_id",)),

@@ -10,6 +10,14 @@ from signaleyes_mcp import build_server
 from signaleyes_mcp.server import MCP_NAMES
 
 
+def _task_response(task_id: str, status: str, error: str | None = None) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={"id": task_id, "status": status, "error": error},
+        request=httpx.Request("GET", "https://example.test/"),
+    )
+
+
 def _tool_names(server) -> list[str]:
     return [t.name for t in asyncio.run(server.list_tools())]
 
@@ -51,6 +59,113 @@ def test_dsm_pages_metadata_excluded_in_favor_of_get_objects_metadata(
     server = build_server("https://example.test/v1", "user", "pass")
     assert "dsm_pages_metadata" not in _tool_names(server)
     assert "get_objects_metadata" in _tool_names(server)
+
+
+def test_thirdparty_arrow_excluded(mock_spec_get, spy_async_client):
+    server = build_server("https://example.test/v1", "user", "pass")
+    assert not any("arrow" in n for n in _tool_names(server))
+
+
+def test_duplicate_post_concepts_excluded(mock_spec_get, spy_async_client):
+    server = build_server("https://example.test/v1", "user", "pass")
+    names = _tool_names(server)
+    assert "concept_closest" in names
+    assert "post_closest" not in names
+
+
+def test_pagination_boilerplate_trimmed_from_descriptions(mock_spec_get, spy_async_client):
+    server = build_server("https://example.test/v1", "user", "pass")
+    tool = asyncio.run(server.get_tool("concept_closest"))
+    assert tool.description == "Find closest."
+
+
+def test_spec_cache_is_written_and_reused(monkeypatch, tmp_path, mock_spec_get, spy_async_client):
+    cache = tmp_path / "spec.json"
+    monkeypatch.setenv("SIGNALEYES_SPEC_CACHE", str(cache))
+
+    build_server("https://example.test/v1", "user", "pass")
+    build_server("https://example.test/v1", "user", "pass")
+
+    assert cache.exists()
+    assert len(mock_spec_get) == 1
+
+
+def test_stale_spec_cache_used_when_fetch_fails(monkeypatch, tmp_path, fake_spec):
+    import json
+    import os
+
+    cache = tmp_path / "spec.json"
+    cache.write_text(json.dumps(fake_spec))
+    os.utime(cache, (0, 0))
+    monkeypatch.setenv("SIGNALEYES_SPEC_CACHE", str(cache))
+
+    def fake_get(url, timeout=None):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    server = build_server("https://example.test/v1", "user", "pass")
+    assert "fetch_all_pages" in _tool_names(server)
+
+
+def test_list_source_entities_reports_variant_enums(mock_spec_get, spy_async_client):
+    server = build_server("https://example.test/v1", "user", "pass")
+    out = asyncio.run(server.call_tool("list_source_entities", {})).structured_content
+    assert out["building"]["variants"] == ["detail", "surrounding"]
+    assert "variants" not in out["agriparcel"]
+
+
+def test_concept_call_waits_for_queued_input_tasks(
+    mock_spec_get, spy_async_client, async_client_get_queue, fast_sleep
+):
+    from types import SimpleNamespace
+
+    from signaleyes_mcp.server import _AwaitInputTasks
+
+    server = build_server("https://example.test/v1", "user", "pass")
+    mw = next(m for m in server.middleware if isinstance(m, _AwaitInputTasks))
+    async_client_get_queue.responses.extend(
+        [
+            _task_response("a", "queued"),
+            _task_response("a", "done"),
+            _task_response("b", "done"),
+        ]
+    )
+    forwarded = []
+
+    async def call_next(ctx):
+        forwarded.append(ctx)
+        return "result"
+
+    ctx = SimpleNamespace(
+        message=SimpleNamespace(
+            arguments={"task_id_primary_entity": "a", "task_id_secondary_entity": "b", "radius": 1}
+        )
+    )
+    assert asyncio.run(mw.on_call_tool(ctx, call_next)) == "result"
+    assert [c["url"] for c in async_client_get_queue.calls] == ["/task/a", "/task/a", "/task/b"]
+    assert forwarded == [ctx]
+
+
+def test_concept_call_surfaces_failed_input_task(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    from types import SimpleNamespace
+
+    from fastmcp.exceptions import ToolError
+
+    from signaleyes_mcp.server import _AwaitInputTasks
+
+    server = build_server("https://example.test/v1", "user", "pass")
+    mw = next(m for m in server.middleware if isinstance(m, _AwaitInputTasks))
+    async_client_get_queue.responses.append(_task_response("a", "failed", "boom"))
+    ctx = SimpleNamespace(message=SimpleNamespace(arguments={"task_id_primary_entity": "a"}))
+
+    async def call_next(ctx):
+        raise AssertionError("must not forward")
+
+    with pytest.raises(ToolError, match="boom"):
+        asyncio.run(mw.on_call_tool(ctx, call_next))
 
 
 def test_subscriptions_excluded_in_favor_of_whoami(mock_spec_get, spy_async_client):

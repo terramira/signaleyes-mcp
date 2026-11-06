@@ -56,6 +56,8 @@ def classify_tool_error(message: str) -> ToolOutcome:
 
 
 def _recovery(status: int | None, message: str) -> tuple[bool, str]:
+    if status == 403 and "subscription" in message:
+        return False, "Outside the subscribed area/sources (see whoami bbox). Do not retry."
     if status in (401, 403):
         return False, "Call whoami once; do not retry other tools until credentials work."
     if status == 422 or "Invalid params" in message:
@@ -69,6 +71,8 @@ def _recovery(status: int | None, message: str) -> tuple[bool, str]:
             return False, "Do not retry this POST (a task may already exist). Check manage_task."
         return True, "Transient upstream error. Retry."
     lower = message.lower()
+    if "did not complete within" in lower:
+        return True, "Task still running. Call wait_for_task again, with a larger max_wait."
     if "timed out" in lower or "timeout" in lower:
         return True, "Transient timeout. Retry."
     return False, "Fix the arguments; do not retry the same call."

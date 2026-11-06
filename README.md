@@ -72,6 +72,10 @@ tools — one `GET .../{id}`, one `GET .../metadata`, and one
 
 **Task management:**
 
+- **`wait_for_tasks`** — resolves many task ids in one call (describe by
+  default, or result); waits run concurrently server-side, so a batch
+  takes as long as its slowest task. Per-task failures are returned under
+  that id instead of failing the batch.
 - **`wait_for_task`** — many endpoints (concepts, analyses, async source
   fetches) return a `task_id` instead of a result. This polls
   `GET /task/{id}` until it's `done`/`failed` and returns the result in one
@@ -114,16 +118,18 @@ which for this API's FastAPI-generated spec repeats the function name and
 path (`get_task_concept_overlay_concept_overlay_get`). Every session that
 connects pays for tool-name length, so this isn't just cosmetic. Where an
 operation has both a GET (task_id-chaining) and POST (live-entity) form —
-`concept_closest`, `concept_density_area`, `concept_density_count` — the GET
-one keeps the plain name, since it's the one this server's skill recommends
-by default; POST gets a `_from_entity` suffix.
+`concept_closest`, `concept_density_area`, `concept_density_count` — only
+the GET one is exposed: it's the one the skill recommends, and each POST
+schema was another 2-3k chars on every session's tool listing. The
+"fetch all pages via response headers" recipe upstream appends to every
+description is stripped for the same reason.
 
 **A quirk worth knowing, not a bug:** the auto-generated `concept_aggregation`
-and `concept_difference_area` tools work correctly, but their `geojson`
-parameter is misleadingly named — pass `{"geojson_list": [...]}` as its
-value, not a bare FeatureCollection. The requestBody schema's `"title"` says
-"Geojson" (which FastMCP uses to name the flattened parameter), but the
-schema it actually `$ref`s is `GeoJsonList`.
+and `concept_difference_area` tools take `geojson_list` — a *list* of
+FeatureCollections (`[{"type": "FeatureCollection", "features": [...]}]`),
+not one bare FeatureCollection. (Older FastMCP versions flattened this
+parameter under the misleading name `geojson`; with fastmcp >= 3.4.6 the
+schema names it `geojson_list` directly.)
 
 ## Setup
 
@@ -232,8 +238,11 @@ resource `skill://signaleyes/SKILL.md`. Tool errors include a recovery hint
 (401 → `whoami`; 422 → fix args, don't retry; POST 502 → don't re-fire,
 check `manage_task`).
 
-Large GeoJSON is truncated at `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES`
-(default 400_000). For counts/stats use `respond_async=True` then
+A FeatureCollection over `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES` (default
+50_000 — above that Claude Code moves the result to a file the model
+never sees inline) is trimmed to whole leading features and marked
+`truncated: true` / `total_features`, so it stays valid JSON;
+`fetch_all_pages` also stops paging once past the cap. For counts/stats use `respond_async=True` then
 `manage_task(view="describe")` instead of pulling geometries. Transient
 GET 429/502/503/504 and connect failures are retried on the HTTP client;
 POST 502 is not, so a concept/task create is not double-fired.
@@ -248,7 +257,8 @@ Read-only tools advertise `readOnlyHint`; `delete_task` advertises
 | `SIGNALEYES_USERNAME` | yes | — |
 | `SIGNALEYES_PASSWORD` | yes | — |
 | `SIGNALEYES_BASE_URL` | no | `https://api.neo.nl/v1` |
-| `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES` | no | `400000` (set `0` to disable truncation) |
+| `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES` | no | `50000` (set `0` to disable truncation) |
+| `SIGNALEYES_SPEC_CACHE` | no | `$XDG_CACHE_HOME/signaleyes-mcp/openapi.json`, reused for 24h and as a fallback when the API is unreachable (set empty to disable) |
 
 Set `SIGNALEYES_BASE_URL=https://api-dev.neo.nl/v1` to point at the dev
 environment instead.

@@ -190,3 +190,11 @@ def test_recovery_hint_covers_409_429_and_post_502():
     assert "manage_task" in (_recovery_hint(502, "POST") or "")
     assert _recovery_hint(502, "GET") is None
     assert _recovery_hint(200, "GET") is None
+
+
+def test_403_subscription_hint_points_at_area_not_credentials():
+    from signaleyes_mcp.server import _recovery_hint
+
+    hint = _recovery_hint(403, "GET", "User x has no active subscription for the requested area")
+    assert hint and "subscription" in hint and "whoami" in hint
+    assert "credentials" not in hint

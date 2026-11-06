@@ -151,3 +151,11 @@ def test_call_tool_classifies_raised_client_errors(mock_spec_get, spy_async_clie
     result = asyncio.run(go())
     assert not result.ok
     assert result.retryable is True
+
+
+def test_wait_deadline_is_retryable_with_wait_hint():
+    out = classify_tool_error(
+        "Error calling tool 'wait_for_task': Task t1 did not complete within 5s"
+    )
+    assert out.retryable is True
+    assert "wait_for_task" in (out.hint or "")

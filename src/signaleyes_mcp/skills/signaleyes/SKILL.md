@@ -22,19 +22,24 @@ you only need counts or attribute stats.
    all must lie in the caller's AOI).
 5. Any result with a `task_id` (or `id` + status `queued`/`running`): `wait_for_task`.
    Need a summary, not geometries? `manage_task(task_id, view="describe")`.
-6. Concepts:
-   - GET `concept_*` — combine two completed fetches via `task_id_primary_entity`
-     / `task_id_secondary_entity`. Prefer these.
-   - POST `concept_*_from_entity` — run against a live entity + polygon.
-7. 401/403 → `whoami` once, then stop retrying other tools until credentials work.
+   Several tasks → one `wait_for_tasks([...])` call (describe by default).
+6. Independent calls run concurrently — fire them in the same turn
+   (several fetches, several concept submits), don't serialize them.
+7. Concepts:
+   - GET `concept_*` — combine two fetches via `task_id_primary_entity`
+     / `task_id_secondary_entity`. Inputs may still be running.
+   - POST `concept_aggregation` / `concept_difference_area` /
+     `concept_shadow_modelling` — post GeoJSON directly (no GET form exists).
+8. 401/403 → `whoami` once, then stop retrying other tools until credentials work.
 
 ## Do not
 
 - Do not poll `manage_task(view="status")` in a loop; use `wait_for_task`.
 - Do not call `delete_task` unless the user asked to drop a task.
 - Do not dump multi-page FeatureCollections into context to "count them".
-- `concept_aggregation` / `concept_difference_area`: the `geojson` argument
-  must be `{"geojson_list": [...]}`, not a bare FeatureCollection.
+- `concept_aggregation` / `concept_difference_area` take `geojson_list`: a
+  list of FeatureCollections (`[{"type": "FeatureCollection", "features":
+  [...]}]`), not one bare FeatureCollection.
 
 ## Errors
 

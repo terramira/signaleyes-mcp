@@ -19,27 +19,31 @@ live API to confirm credentials/connectivity work).
 
 import argparse
 import asyncio
+import json
 import os
 import random
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Literal, Never
 
 import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddleware
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.server.providers.openapi import MCPType, OpenAPITool, RouteMap
 from fastmcp.server.providers.skills import SkillProvider
 from fastmcp.utilities.openapi import HTTPRoute
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolRequestParams, ToolAnnotations
 
 # Binary/XML endpoints an LLM tool call can't usefully consume: raw OGC WFS,
 # vector tiles, DSM/DTM raster tiles (their openapi.json entry claims
 # application/json, but they actually return image/tiff — confirmed by
 # direct request, not just spec-reading), the shadow-modelling raster, and
-# the usage-records XLSX export. /subscriptions and /token/* are excluded
+# the usage-records XLSX export, and the Apache Arrow IPC form of the
+# thirdparty query. /subscriptions and /token/* are excluded
 # for a different reason: /subscriptions just duplicates `whoami`, and the
 # /token/* endpoints issue OAuth2 bearer tokens this server never uses (the
 # shared httpx client always signs requests with HTTP Basic auth instead) —
@@ -49,6 +53,7 @@ EXCLUDED_PATTERNS = (
     r"^/source/wfs/.*",
     r"^/source/tiles/.*",
     r"^/source/(dsm|dtm)(/pages)?(/\{quadkey\})?$",
+    r"^/source/thirdparty/\{identifier\}/arrow$",
     r"^/analyses/shadow_modelling$",
     r"^/usage/records$",
     r"^/subscriptions$",
@@ -89,6 +94,18 @@ _BROKEN_POLYGON_BODY_POST_PATTERNS = (
 
 # A small real area (Venlo, NL) known to have buildings/trees/roads, used by
 # `smoke` as a default query when the caller doesn't supply one.
+# closest/density_area/density_count exist as both GET (chain a task_id) and
+# POST (post live GeoJSON). The skill tells the model to use the GET form and
+# the POST form's schema is 2-3k chars each, paid on every session's tool
+# listing — so the POST form is excluded rather than renamed.
+_DUPLICATE_POST_CONCEPT_PATTERN = r"^/concept/(closest|density_area|density_count)$"
+
+# Upstream descriptions end with a long "how to paginate via response
+# headers" recipe. The auto-generated tools can't see headers, and
+# fetch_all_pages already handles paging, so it's dead weight on every
+# session's tool listing.
+_PAGINATION_BOILERPLATE = "The data is delivered in pages."
+
 SMOKE_POLYGON = (
     "POLYGON ((5.611503 51.644082, 5.611503 51.646226, "
     "5.61734 51.646226, 5.61734 51.644082, 5.611503 51.644082))"
@@ -109,9 +126,6 @@ _VARIANT_PARAM_NAMES = ("entity", "identifier")
 # Mapped here to short, stable names instead; keyed by the exact operationId
 # so a wrong/renamed key just silently falls back to the default rather than
 # erroring — verify against a fresh openapi.json if a name below goes missing.
-# Where an operation has both a GET (task_id-chaining) and POST (live-entity)
-# form, the GET one — the one this server's skill recommends by default —
-# keeps the plain name; POST gets a "_from_entity" suffix.
 MCP_NAMES = {
     "run_analyses_3_30_300_analyses_3_30_300_get": "analyses_3_30_300",
     "run_analyses_baf_analyses_baf__get": "analyses_baf",
@@ -119,11 +133,8 @@ MCP_NAMES = {
     "get_single_task_concept_buffer_concept_buffer_get": "concept_buffer",
     "get_task_concept_clip_concept_clip_get": "concept_clip",
     "get_task_concept_closest_concept_closest_get": "concept_closest",
-    "run_concept_closest_concept_closest_post": "concept_closest_from_entity",
     "get_task_concept_density_area_concept_density_area_get": "concept_density_area",
-    "run_concept_density_area_concept_density_area_post": "concept_density_area_from_entity",
     "get_task_concept_density_count_concept_density_count_get": "concept_density_count",
-    "run_concept_density_count_concept_density_count_post": "concept_density_count_from_entity",
     "run_concept_difference_area_concept_difference_area_post": "concept_difference_area",
     "get_task_concept_overlay_concept_overlay_get": "concept_overlay",
     "get_task_concept_sjoin_concept_sjoin_get": "concept_sjoin",
@@ -135,10 +146,15 @@ MCP_NAMES = {
 }
 
 SourceRegistry = dict[str, dict[str, dict[bool, str]]]
+SourceVariants = dict[str, list[str]]
+_TASK_INPUT_ARGS = ("task_id_primary_entity", "task_id_secondary_entity")
 TransportName = Literal["stdio", "http"]
 
 _SKILLS_DIR = Path(__file__).resolve().parent / "skills"
-_DEFAULT_MAX_RESPONSE_BYTES = 400_000
+# Claude Code shunts tool results above ~25k tokens to a file the model never
+# sees inline. Coordinate-heavy GeoJSON tokenizes at ~3 chars/token, so a
+# 95 KB result still went to file in testing; 50 KB stays inline.
+_DEFAULT_MAX_RESPONSE_BYTES = 50_000
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 _SAFE_RETRY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
@@ -162,7 +178,7 @@ sjoin, ...) over an area-of-interest polygon.
 
 Read resource skill://signaleyes/SKILL.md before the first tool call — it is
 the workflow for this API (when to fetch vs describe, GET vs POST concepts,
-the geojson_list quirk).
+the geojson_list shape).
 
 Typical flow:
 1. Unsure which dataset/entity to use? Call `list_source_entities` — it
@@ -177,7 +193,11 @@ Typical flow:
    already-fetched results via their task_ids (task_id_primary_entity /
    task_id_secondary_entity).
 5. Any tool result containing a bare `task_id` needs `wait_for_task` (or
-   `manage_task`) before its data is usable — poll, don't guess.
+   `manage_task`) before its data is usable — poll, don't guess. Several
+   tasks? `wait_for_tasks` resolves them all in one call.
+
+Independent calls run concurrently: issue them in the same turn (several
+fetches, several concept submits) instead of one after another.
 
 If a call fails with 401/403, run `whoami` first to confirm credentials.
 Only want counts/stats, not geometries? `manage_task(view="describe")`
@@ -200,7 +220,12 @@ def _retry_delay(attempt: int, backoff: float = 0.4) -> float:
     return float(backoff * (2**attempt) * (0.5 + random.random()))
 
 
-def _recovery_hint(status_code: int, method: str) -> str | None:
+def _recovery_hint(status_code: int, method: str, detail: str | None = None) -> str | None:
+    if status_code == 403 and detail and "subscription" in detail:
+        return (
+            "Area or source is outside this account's subscription. whoami shows the "
+            "subscribed bbox; do not retry the same polygon."
+        )
     if status_code in (401, 403):
         return "Call whoami once; do not retry other tools until credentials work."
     if status_code == 422:
@@ -236,10 +261,103 @@ class _RetryTransport(httpx.AsyncBaseTransport):
         return response
 
 
+async def _poll_until_done(
+    client: httpx.AsyncClient,
+    task_id: str,
+    max_wait: float,
+    poll_interval: float,
+    fetch_result: bool = False,
+) -> dict[str, Any] | None:
+    """Block until a task is done (optionally returning its result); raise on failure or deadline.
+
+    Polling starts at 0.3s and doubles up to `poll_interval`: small tasks
+    finish in a few seconds, so a fixed 2s tick wasted up to 2s per wait.
+    A transient timeout/5xx on one poll is retried on the next tick.
+
+    A task that ends in `failed` is deleted (best effort) before raising —
+    its error is already in the exception, and the API keeps failed tasks
+    around otherwise. A task still running at the deadline is left alone:
+    the API refuses to delete queued/running tasks (409), so the only way
+    out is to wait again.
+    """
+    delay = min(0.3, poll_interval)
+    try:
+        async with asyncio.timeout(max_wait):
+            while True:
+                try:
+                    status_resp = await client.get(f"/task/{task_id}")
+                    # A failed task's status comes back as HTTP 500 with
+                    # {"status": "failed", ...} in the body — read the body
+                    # before treating the 5xx as transient, or the poll loop
+                    # spins on a dead task until max_wait.
+                    status_body = _json_body(status_resp)
+                    if status_body.get("status") != "failed":
+                        _check_response(status_resp)
+                    status = status_body.get("status")
+                    if status == "done":
+                        if not fetch_result:
+                            return None
+                        result_resp = await client.get(f"/task/{task_id}/result")
+                        _check_response(result_resp)
+                        result: dict[str, Any] = result_resp.json()
+                        return result
+                    if status == "failed":
+                        try:
+                            await client.delete(f"/task/{task_id}")
+                        except httpx.HTTPError:
+                            pass
+                        raise RuntimeError(
+                            f"Task {task_id} failed: {status_body.get('error')} (task deleted)"
+                        )
+                except (httpx.TimeoutException, httpx.NetworkError):
+                    pass
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code not in _RETRYABLE_STATUSES:
+                        raise
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, poll_interval)
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"Task {task_id} did not complete within {max_wait}s; it is still running "
+            "server-side and cannot be deleted until it finishes — wait_for_task again."
+        ) from exc
+
+
+class _AwaitInputTasks(Middleware):
+    """Wait for a concept's input tasks before forwarding the call.
+
+    The API 409s a GET /concept/* whose task_id_* input is still queued or
+    running, so a fetch → buffer → sjoin chain fired back-to-back fails on
+    the second hop unless the caller waits in between. Doing the wait here
+    lets chains be submitted without a wait_for_task per hop.
+    """
+
+    def __init__(self, client: httpx.AsyncClient, max_wait: float = 120.0) -> None:
+        self._client = client
+        self._max_wait = max_wait
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[CallToolRequestParams],
+        call_next: CallNext[CallToolRequestParams, Any],
+    ) -> Any:
+        args = context.message.arguments or {}
+        for key in _TASK_INPUT_ARGS:
+            task_id = args.get(key)
+            if isinstance(task_id, str):
+                try:
+                    await _poll_until_done(self._client, task_id, self._max_wait, 2.0)
+                except (RuntimeError, TimeoutError, httpx.HTTPError) as exc:
+                    raise ToolError(f"{key}={task_id}: {exc}") from exc
+        return await call_next(context)
+
+
 def _annotate_openapi_component(route: HTTPRoute, component: object) -> None:
     """Mark generated tools so an orchestrator can allowlist reads vs deletes."""
     if not isinstance(component, OpenAPITool):
         return
+    if component.description and _PAGINATION_BOILERPLATE in component.description:
+        component.description = component.description.split(_PAGINATION_BOILERPLATE)[0].rstrip()
     method = route.method.upper()
     if method == "GET":
         component.annotations = _READ_OPEN
@@ -292,7 +410,7 @@ def _check_response(resp: httpx.Response) -> None:
             detail = resp.json().get("detail")
         except ValueError:
             pass
-        hint = _recovery_hint(resp.status_code, exc.request.method)
+        hint = _recovery_hint(resp.status_code, exc.request.method, str(detail) if detail else None)
         parts = [str(exc)]
         if detail:
             parts.append(str(detail))
@@ -305,11 +423,93 @@ def _check_response(resp: httpx.Response) -> None:
         raise
 
 
+def _summarize_wkt(wkt: Any) -> Any:
+    """Replace a WKT AOI with its bbox: a real subscription polygon is ~180 KB of text."""
+    if not isinstance(wkt, str):
+        return wkt
+    nums = [float(n) for n in re.findall(r"-?\d+(?:\.\d+)?", wkt)]
+    xs, ys = nums[0::2], nums[1::2]
+    if not xs or not ys:
+        return wkt
+    return {"bbox": [min(xs), min(ys), max(xs), max(ys)], "wkt_chars": len(wkt)}
+
+
+def _json_body(resp: httpx.Response) -> dict[str, Any]:
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _bounded(result: dict[str, Any], max_bytes: int) -> dict[str, Any]:
+    """Keep a FeatureCollection under max_bytes by dropping trailing features.
+
+    The byte-cap middleware cuts the serialized text mid-string, which an
+    orchestrator client then can't parse (structured_content comes back
+    None). Trimming whole features keeps the result valid JSON and says
+    how much was left out.
+    """
+    features = result.get("features")
+    if max_bytes <= 0 or not isinstance(features, list):
+        return result
+    if len(json.dumps(result)) <= max_bytes:
+        return result
+    budget = max_bytes - len(json.dumps({**result, "features": []})) - 200
+    kept: list[Any] = []
+    for feature in features:
+        budget -= len(json.dumps(feature)) + 1
+        if budget < 0:
+            break
+        kept.append(feature)
+    return {
+        **result,
+        "features": kept,
+        "truncated": True,
+        "total_features": len(features),
+        "hint": "Result exceeded the size cap. Use respond_async=True then "
+        "manage_task(view='describe'), or geo_type='centroid' / simplify / filter_string.",
+    }
+
+
+def _load_spec(base_url: str) -> dict[str, Any]:
+    """openapi.json is ~470 KB with no ETag; cache it a day so startup skips the fetch.
+
+    A stale cache also lets the server boot while api.neo.nl is unreachable.
+    SIGNALEYES_SPEC_CACHE overrides the path; empty disables caching.
+    """
+    cache_env = os.environ.get("SIGNALEYES_SPEC_CACHE")
+    cache: Path | None
+    if cache_env is None:
+        cache_dir = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        cache = cache_dir / "signaleyes-mcp" / "openapi.json"
+    else:
+        cache = Path(cache_env) if cache_env else None
+    if cache and cache.exists() and time.time() - cache.stat().st_mtime < 86_400:
+        spec: dict[str, Any] = json.loads(cache.read_text())
+        return spec
+    try:
+        resp = httpx.get(f"{base_url}/openapi.json", timeout=30)
+        resp.raise_for_status()
+    except (httpx.HTTPError, OSError):
+        if cache and cache.exists():
+            stale: dict[str, Any] = json.loads(cache.read_text())
+            return stale
+        raise
+    if cache:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(resp.text)
+    fresh: dict[str, Any] = resp.json()
+    return fresh
+
+
 def _is_excluded(path: str) -> bool:
     return any(re.match(p, path) for p in EXCLUDED_PATTERNS)
 
 
-def _build_source_registry(spec: dict[str, Any]) -> tuple[SourceRegistry, list[str]]:
+def _build_source_registry(
+    spec: dict[str, Any],
+) -> tuple[SourceRegistry, SourceVariants, list[str]]:
     """Derive the /source/{entity} operation support matrix from the live spec.
 
     Almost every /source/* path is one of four shapes: "list" (the polygon
@@ -324,11 +524,15 @@ def _build_source_registry(spec: dict[str, Any]) -> tuple[SourceRegistry, list[s
     auto-generated server already has.
 
     Returns the registry (entity -> shape -> {variant_required: path
-    template, using the placeholder "{variant}"/"{id}"}), plus the literal
-    (non-normalized) list of GET "list" paths — used to exclude the
-    single-page auto-generated tools that `fetch_all_pages` already covers.
+    template, using the placeholder "{variant}"/"{id}"}), the valid
+    variant values per entity where the spec declares them as an enum
+    (building: detail/surrounding, tree: crown/stem/..., so callers don't
+    have to guess), plus the literal (non-normalized) list of GET "list"
+    paths — used to exclude the single-page auto-generated tools that
+    `fetch_all_pages` already covers.
     """
     registry: SourceRegistry = {}
+    variants: SourceVariants = {}
     list_get_paths: list[str] = []
     for path, path_item in spec.get("paths", {}).items():
         if not path.startswith("/source/") or _is_excluded(path):
@@ -361,7 +565,11 @@ def _build_source_registry(spec: dict[str, Any]) -> tuple[SourceRegistry, list[s
             registry.setdefault(entity_key, {}).setdefault(shape, {})[requires_variant] = "/".join(
                 norm
             )
-    return registry, list_get_paths
+            for param in path_item[method].get("parameters", []):
+                enum = param.get("schema", {}).get("enum")
+                if param.get("name") in _VARIANT_PARAM_NAMES and enum:
+                    variants[entity_key] = list(enum)
+    return registry, variants, list_get_paths
 
 
 def _route_pattern(template: str) -> str:
@@ -398,10 +606,14 @@ def _resolve_source_path(
     return templates[has_variant].format(variant=variant, **path_kwargs)
 
 
-def _describe_source_registry(registry: SourceRegistry) -> dict[str, dict[str, str]]:
-    described: dict[str, dict[str, str]] = {}
+def _describe_source_registry(
+    registry: SourceRegistry, enums: SourceVariants | None = None
+) -> dict[str, dict[str, Any]]:
+    described: dict[str, dict[str, Any]] = {}
     for entity, shapes in sorted(registry.items()):
-        entry: dict[str, str] = {}
+        entry: dict[str, Any] = {}
+        if enums and entity in enums:
+            entry["variants"] = enums[entity]
         for shape in ("list", "by_id", "metadata", "batch"):
             variants = shapes.get(shape)
             if variants is None:
@@ -417,17 +629,15 @@ def _describe_source_registry(registry: SourceRegistry) -> dict[str, dict[str, s
 
 
 def build_server(base_url: str, username: str, password: str) -> FastMCP:
-    resp = httpx.get(f"{base_url}/openapi.json", timeout=30)
-    resp.raise_for_status()
-    spec = resp.json()
+    spec = _load_spec(base_url)
 
     client = _make_client(base_url, username, password)
-    source_registry, redundant_list_paths = _build_source_registry(spec)
+    source_registry, source_variants, redundant_list_paths = _build_source_registry(spec)
 
     route_maps = [RouteMap(pattern=p, mcp_type=MCPType.EXCLUDE) for p in EXCLUDED_PATTERNS]
     route_maps.extend(
         RouteMap(pattern=p, methods=["POST"], mcp_type=MCPType.EXCLUDE)
-        for p in _BROKEN_POLYGON_BODY_POST_PATTERNS
+        for p in (*_BROKEN_POLYGON_BODY_POST_PATTERNS, _DUPLICATE_POST_CONCEPT_PATTERN)
     )
     # /source/{entity}/{id}, /metadata, and POST .../batch for every entity
     # collapse into get_object_by_id / get_objects_metadata /
@@ -470,17 +680,11 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         mcp_component_fn=_annotate_openapi_component,
     )
     mcp.add_provider(SkillProvider(_SKILLS_DIR / "signaleyes"))
+    mcp.add_middleware(_AwaitInputTasks(client))
+    # Every tool that can return a FeatureCollection trims it via _bounded()
+    # rather than a byte-cap middleware: the middleware cut the serialized
+    # text mid-string, and counted text + structured content twice.
     max_bytes = _max_response_bytes()
-    if max_bytes > 0:
-        mcp.add_middleware(
-            ResponseLimitingMiddleware(
-                max_size=max_bytes,
-                truncation_suffix=(
-                    "\n\n[truncated at size cap. Use respond_async=True then "
-                    "manage_task(view='describe') instead of pulling full geometries.]"
-                ),
-            )
-        )
 
     @mcp.tool(annotations=_READ_OPEN)
     async def wait_for_task(
@@ -496,33 +700,50 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         into one call instead of many separate tool round-trips.
 
         A single slow request during polling doesn't fail the whole call —
-        it's retried on the next poll_interval tick, still bounded by
-        max_wait — since a transient timeout on one poll says nothing about
-        whether the task itself succeeded.
+        it's retried on the next tick, still bounded by max_wait — since a
+        transient timeout on one poll says nothing about whether the task
+        itself succeeded. Polling starts at 0.3s and backs off to
+        `poll_interval`.
         """
-        try:
-            async with asyncio.timeout(max_wait):
-                while True:
-                    try:
-                        status_resp = await client.get(f"/task/{task_id}")
-                        _check_response(status_resp)
-                        status_body = status_resp.json()
-                        status = status_body["status"]
-                        if status == "done":
-                            result_resp = await client.get(f"/task/{task_id}/result")
-                            _check_response(result_resp)
-                            result: dict[str, Any] = result_resp.json()
-                            return result
-                        if status == "failed":
-                            raise RuntimeError(f"Task {task_id} failed: {status_body.get('error')}")
-                    except (httpx.TimeoutException, httpx.NetworkError):
-                        pass
-                    except httpx.HTTPStatusError as exc:
-                        if exc.response.status_code not in _RETRYABLE_STATUSES:
-                            raise
-                    await asyncio.sleep(poll_interval)
-        except TimeoutError as exc:
-            raise TimeoutError(f"Task {task_id} did not complete within {max_wait}s") from exc
+        result = await _poll_until_done(client, task_id, max_wait, poll_interval, fetch_result=True)
+        assert result is not None
+        return _bounded(result, max_bytes)
+
+    @mcp.tool(annotations=_READ_OPEN)
+    async def wait_for_tasks(
+        task_ids: list[str], view: str = "describe", max_wait: float = 120.0
+    ) -> dict[str, Any]:
+        """Wait for several tasks at once and return each one's describe (default) or result.
+
+        One call instead of one `wait_for_task` per task: the waits run
+        concurrently server-side, so N tasks take as long as the slowest,
+        not the sum. Returns {task_id: ...}; a task that fails or times
+        out yields {"error": ...} under its id without sinking the others.
+        With view="result" the size cap is shared across the batch, so
+        prefer "describe" unless you need geometries.
+        """
+        if view not in ("describe", "result"):
+            raise ValueError(f"view must be 'describe' or 'result', got {view!r}")
+        per_task_bytes = max_bytes // max(len(task_ids), 1)
+
+        async def one(task_id: str) -> dict[str, Any]:
+            try:
+                if view == "result":
+                    result = await _poll_until_done(
+                        client, task_id, max_wait, 2.0, fetch_result=True
+                    )
+                    assert result is not None
+                    return _bounded(result, per_task_bytes)
+                await _poll_until_done(client, task_id, max_wait, 2.0)
+                resp = await client.get(f"/task/{task_id}/describe")
+                _check_response(resp)
+                described: dict[str, Any] = resp.json()
+                return described
+            except (RuntimeError, TimeoutError, httpx.HTTPError) as exc:
+                return {"error": str(exc)}
+
+        results = await asyncio.gather(*(one(t) for t in task_ids))
+        return dict(zip(task_ids, results))
 
     @mcp.tool(annotations=_READ_OPEN)
     async def manage_task(task_id: str, view: str = "status") -> dict[str, Any]:
@@ -552,10 +773,10 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         resp = await client.get(f"/task/{task_id}{views[view]}")
         _check_response(resp)
         result: dict[str, Any] = resp.json()
-        return result
+        return _bounded(result, max_bytes)
 
     @mcp.tool(annotations=_READ_LOCAL)
-    def list_source_entities() -> dict[str, dict[str, str]]:
+    def list_source_entities() -> dict[str, dict[str, Any]]:
         """List every /source/{entity} dataset and which operations it supports.
 
         Start here when unsure which `entity`/`variant` to pass to
@@ -566,9 +787,10 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         Returns, per entity, which of "list" (polygon query), "by_id",
         "metadata", "batch" it supports, and whether that operation needs a
         `variant` sub-type ("no variant" / "variant required" / "variant
-        optional" — optional means both a bare and a variant form exist).
+        optional" — optional means both a bare and a variant form exist),
+        plus "variants": the valid values where the API declares them.
         """
-        return _describe_source_registry(source_registry)
+        return _describe_source_registry(source_registry, source_variants)
 
     @mcp.tool(annotations=_READ_OPEN)
     async def get_object_by_id(
@@ -578,13 +800,13 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
 
         See `list_source_entities` for which entities support this and
         whether `variant` is required (e.g. entity="building" needs a
-        variant like "school"; entity="water" takes none at all).
+        variant like "detail"; entity="water" takes none at all).
         """
         path = _resolve_source_path(source_registry, entity, "by_id", variant, id=object_id)
         resp = await client.get(path)
         _check_response(resp)
         result: dict[str, Any] = resp.json()
-        return result
+        return _bounded(result, max_bytes)
 
     @mcp.tool(annotations=_READ_OPEN)
     async def post_objects_by_ids(
@@ -601,7 +823,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         resp = await client.post(path, json={"ids": ids})
         _check_response(resp)
         result: dict[str, Any] = resp.json()
-        return result
+        return _bounded(result, max_bytes)
 
     @mcp.tool(annotations=_READ_OPEN)
     async def get_objects_metadata(entity: str, variant: str | None = None) -> dict[str, Any]:
@@ -644,9 +866,10 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         intersect_centroid, attributes/groupby — the last two only apply to
         entity="thirdparty").
 
-        `max_pages` defaults low (10, not "all") so an unexpectedly large
-        area doesn't flood your context with features — raise it
-        explicitly once you know the area is small, or set
+        Paging stops at `max_pages` (default 10) or once the accumulated
+        response passes the size cap, whichever comes first, so an
+        unexpectedly large area doesn't flood your context with features —
+        raise `max_pages` once you know the area is small, or set
         respond_async=True to have the API gather every page itself and
         hand back a `task_id` instead (feed that to `wait_for_task`).
 
@@ -686,18 +909,23 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         features: list[dict[str, Any]] = []
         page = 1
         total_pages = 1
-        while page <= min(total_pages, max_pages):
+        size = 0
+        while page <= min(total_pages, max_pages) and (max_bytes <= 0 or size < max_bytes):
             resp = await client.get(path, params={"polygon": polygon, "page": page, **extra_params})
             _check_response(resp)
             total_pages = int(resp.headers.get("X-Total-Pages", 1))
             features.extend(resp.json().get("features", []))
+            size += len(resp.content)
             page += 1
-        return {
-            "type": "FeatureCollection",
-            "features": features,
-            "total_pages": total_pages,
-            "pages_fetched": min(total_pages, max_pages),
-        }
+        return _bounded(
+            {
+                "type": "FeatureCollection",
+                "features": features,
+                "total_pages": total_pages,
+                "pages_fetched": page - 1,
+            },
+            max_bytes,
+        )
 
     @mcp.tool(annotations=_WRITE_OPEN)
     async def post_large_polygon(
@@ -753,7 +981,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         if "X-Total-Pages" in resp.headers:
             result["total_pages"] = int(resp.headers["X-Total-Pages"])
             result["page"] = int(resp.headers.get("X-Page-Number", page))
-        return result
+        return _bounded(result, max_bytes)
 
     @mcp.tool(annotations=_READ_OPEN)
     async def whoami() -> dict[str, Any]:
@@ -761,6 +989,8 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         resp = await client.get("/subscriptions")
         _check_response(resp)
         body: dict[str, Any] = resp.json()
+        for sub in body.get("subscriptions", []):
+            sub["aoi"] = _summarize_wkt(sub.get("aoi"))
         return body
 
     return mcp

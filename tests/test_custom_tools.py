@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -67,8 +68,12 @@ def test_wait_for_task_polls_until_done(
 
 
 def test_wait_for_task_raises_on_failed_status(
-    mock_spec_get, spy_async_client, async_client_get_queue
+    monkeypatch, mock_spec_get, spy_async_client, async_client_get_queue
 ):
+    async def fake_delete(self, url, **kwargs):
+        return _response(status_code=204)
+
+    monkeypatch.setattr(httpx.AsyncClient, "delete", fake_delete)
     server = _server(mock_spec_get, spy_async_client)
     async_client_get_queue.responses.append(
         _response(json={"id": "t1", "status": "failed", "error": "bad polygon"})
@@ -78,12 +83,70 @@ def test_wait_for_task_raises_on_failed_status(
         _call(server, "wait_for_task", {"task_id": "t1"})
 
 
+def test_wait_for_task_deletes_a_failed_task(
+    monkeypatch, mock_spec_get, spy_async_client, async_client_get_queue
+):
+    deleted = []
+
+    async def fake_delete(self, url, **kwargs):
+        deleted.append(url)
+        return _response(status_code=204)
+
+    monkeypatch.setattr(httpx.AsyncClient, "delete", fake_delete)
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(json={"id": "t1", "status": "failed", "error": "out of memory"})
+    )
+
+    with pytest.raises(ToolError, match="out of memory.*deleted"):
+        _call(server, "wait_for_task", {"task_id": "t1"})
+    assert deleted == ["/task/t1"]
+
+
+def test_wait_for_task_treats_500_with_failed_body_as_failed_not_transient(
+    monkeypatch, mock_spec_get, spy_async_client, async_client_get_queue
+):
+    """The live API answers GET /task/{id} for a failed task with HTTP 500."""
+    deleted = []
+
+    async def fake_delete(self, url, **kwargs):
+        deleted.append(url)
+        return _response(status_code=200, json={"id": "t1", "deleted": True})
+
+    monkeypatch.setattr(httpx.AsyncClient, "delete", fake_delete)
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(status_code=500, json={"id": "t1", "status": "failed", "error": "ISE"})
+    )
+
+    with pytest.raises(ToolError, match="failed: ISE.*deleted"):
+        _call(server, "wait_for_task", {"task_id": "t1"})
+    assert len(async_client_get_queue.calls) == 1
+    assert deleted == ["/task/t1"]
+
+
+def test_wait_for_task_failure_still_raises_when_delete_errors(
+    monkeypatch, mock_spec_get, spy_async_client, async_client_get_queue
+):
+    async def failing_delete(self, url, **kwargs):
+        raise httpx.ConnectError("gone")
+
+    monkeypatch.setattr(httpx.AsyncClient, "delete", failing_delete)
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(json={"id": "t1", "status": "failed", "error": "boom"})
+    )
+
+    with pytest.raises(ToolError, match="boom"):
+        _call(server, "wait_for_task", {"task_id": "t1"})
+
+
 def test_wait_for_task_raises_timeout_when_never_done(
     mock_spec_get, spy_async_client, async_client_get_queue, fast_sleep
 ):
     server = _server(mock_spec_get, spy_async_client)
     async_client_get_queue.responses.extend(
-        [_response(json={"id": "t1", "status": "running", "error": None}) for _ in range(2)]
+        [_response(json={"id": "t1", "status": "running", "error": None}) for _ in range(4)]
     )
 
     with pytest.raises(ToolError, match="did not complete"):
@@ -470,6 +533,114 @@ def test_post_large_polygon_passes_through_filters(
     }
 
 
+# --- wait_for_tasks --------------------------------------------------------
+
+
+def test_wait_for_tasks_describes_each_and_isolates_failures(
+    monkeypatch, mock_spec_get, spy_async_client
+):
+    """Responses keyed by URL (not a queue) because the waits run concurrently."""
+    by_url = {
+        "/task/a": _response(json={"id": "a", "status": "done", "error": None}),
+        "/task/a/describe": _response(json={"tree": {"number_of_features": 3}}),
+        "/task/b": _response(json={"id": "b", "status": "failed", "error": "boom"}),
+    }
+
+    async def fake_get(self, url, **kwargs):
+        return by_url[url]
+
+    async def fake_delete(self, url, **kwargs):
+        return _response(status_code=200)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    monkeypatch.setattr(httpx.AsyncClient, "delete", fake_delete)
+    server = _server(mock_spec_get, spy_async_client)
+
+    out = _call(server, "wait_for_tasks", {"task_ids": ["a", "b"]}).structured_content
+
+    assert out["a"] == {"tree": {"number_of_features": 3}}
+    assert "boom" in out["b"]["error"]
+
+
+def test_wait_for_tasks_rejects_unknown_view(mock_spec_get, spy_async_client):
+    server = _server(mock_spec_get, spy_async_client)
+    with pytest.raises(ToolError, match="describe"):
+        _call(server, "wait_for_tasks", {"task_ids": ["a"], "view": "status"})
+
+
+# --- size cap -------------------------------------------------------------
+
+
+def _big_feature(i: int) -> dict:
+    return {"id": i, "geometry": {"coordinates": [[0.123456789] * 200]}}
+
+
+def test_wait_for_task_trims_whole_features_under_the_cap(
+    monkeypatch, mock_spec_get, spy_async_client, async_client_get_queue
+):
+    monkeypatch.setenv("SIGNALEYES_MAX_TOOL_RESPONSE_BYTES", "5000")
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.extend(
+        [
+            _response(json={"id": "t1", "status": "done", "error": None}),
+            _response(
+                json={"type": "FeatureCollection", "features": [_big_feature(i) for i in range(50)]}
+            ),
+        ]
+    )
+
+    result = _call(server, "wait_for_task", {"task_id": "t1"})
+
+    body = result.structured_content
+    assert body["truncated"] is True
+    assert body["total_features"] == 50
+    assert 0 < len(body["features"]) < 50
+    assert body["features"][0]["id"] == 0
+    assert len(json.dumps(body)) <= 5000
+
+
+def test_fetch_all_pages_stops_paging_once_past_the_cap(
+    monkeypatch, mock_spec_get, spy_async_client, async_client_get_queue
+):
+    monkeypatch.setenv("SIGNALEYES_MAX_TOOL_RESPONSE_BYTES", "3000")
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.extend(
+        [
+            _response(json={"features": [_big_feature(p)]}, headers={"X-Total-Pages": "10"})
+            for p in range(1, 11)
+        ]
+    )
+
+    result = _call(server, "fetch_all_pages", {"entity": "building", "polygon": "POLYGON ((0 0))"})
+
+    assert len(async_client_get_queue.calls) == 2
+    assert result.structured_content["pages_fetched"] == 2
+    assert result.structured_content["total_pages"] == 10
+
+
+def test_wait_for_task_polls_fast_first_then_backs_off(
+    mock_spec_get, spy_async_client, async_client_get_queue, monkeypatch
+):
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.extend(
+        [_response(json={"id": "t1", "status": "running", "error": None}) for _ in range(5)]
+        + [
+            _response(json={"id": "t1", "status": "done", "error": None}),
+            _response(json={"type": "FeatureCollection", "features": []}),
+        ]
+    )
+
+    _call(server, "wait_for_task", {"task_id": "t1"})
+
+    assert sleeps == [0.3, 0.6, 1.2, 2.0, 2.0]
+
+
 # --- whoami -------------------------------------------------------------
 
 
@@ -481,6 +652,21 @@ def test_whoami_returns_subscriptions_body(mock_spec_get, spy_async_client, asyn
 
     assert result.structured_content == {"plan": "pro", "seats": 3}
     assert async_client_get_queue.calls[0]["url"] == "/subscriptions"
+
+
+def test_whoami_replaces_aoi_wkt_with_bbox(mock_spec_get, spy_async_client, async_client_get_queue):
+    server = _server(mock_spec_get, spy_async_client)
+    wkt = "POLYGON ((5.0 52.0, 5.0 52.5, 5.25 52.5, 5.25 52.0, 5.0 52.0))"
+    async_client_get_queue.responses.append(
+        _response(json={"username": "u", "subscriptions": [{"aoi": wkt, "end_date": "2027"}]})
+    )
+
+    result = _call(server, "whoami", {})
+
+    assert result.structured_content["subscriptions"][0] == {
+        "aoi": {"bbox": [5.0, 52.0, 5.25, 52.5], "wkt_chars": len(wkt)},
+        "end_date": "2027",
+    }
 
 
 def test_whoami_propagates_http_error(mock_spec_get, spy_async_client, async_client_get_queue):
