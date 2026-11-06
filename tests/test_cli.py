@@ -5,13 +5,7 @@ import asyncio
 import httpx
 import pytest
 
-from signaleyes_mcp.server import (
-    SMOKE_ENTITIES,
-    _build_arg_parser,
-    _check_response,
-    run_smoke,
-    run_tests,
-)
+from signaleyes_mcp.server import SMOKE_ENTITIES, _build_arg_parser, run_smoke
 
 
 def _response(status_code=200, json=None, headers=None) -> httpx.Response:
@@ -31,14 +25,14 @@ def test_no_args_means_no_command():
     assert args.command is None
 
 
-def test_serve_is_a_valid_subcommand():
-    args = _build_arg_parser().parse_args(["serve"])
+def test_serve_http_transport_args():
+    args = _build_arg_parser().parse_args(
+        ["serve", "--transport", "http", "--host", "0.0.0.0", "--port", "9000"]
+    )
     assert args.command == "serve"
-
-
-def test_test_is_a_valid_subcommand():
-    args = _build_arg_parser().parse_args(["test"])
-    assert args.command == "test"
+    assert args.transport == "http"
+    assert args.host == "0.0.0.0"
+    assert args.port == 9000
 
 
 def test_smoke_defaults_entity_to_none_and_polygon_to_sample():
@@ -59,27 +53,6 @@ def test_smoke_accepts_entity_and_polygon_overrides():
 def test_smoke_rejects_unknown_entity():
     with pytest.raises(SystemExit):
         _build_arg_parser().parse_args(["smoke", "--entity", "not-a-real-entity"])
-
-
-# --- run_tests ------------------------------------------------------------
-
-
-def test_run_tests_invokes_pytest_main(monkeypatch):
-    import pytest as pytest_module
-
-    calls = []
-    monkeypatch.setattr(pytest_module, "main", lambda args: calls.append(args) or 0)
-
-    assert run_tests() == 0
-    assert calls == [["-q"]]
-
-
-def test_run_tests_returns_pytest_exit_code(monkeypatch):
-    import pytest as pytest_module
-
-    monkeypatch.setattr(pytest_module, "main", lambda args: 2)
-
-    assert run_tests() == 2
 
 
 # --- run_smoke ------------------------------------------------------------
@@ -126,24 +99,3 @@ def test_run_smoke_picks_a_random_entity_when_none_given(async_client_get_queue,
 def test_run_smoke_entity_choices_are_all_valid_source_names():
     # Sanity: the choices offered on the CLI are exactly what run_smoke can pick from.
     assert set(SMOKE_ENTITIES) == {"building", "tree", "road", "water", "solarpanel"}
-
-
-# --- _check_response --------------------------------------------------------
-
-
-def test_check_response_passes_through_on_success():
-    _check_response(_response(200, json={"ok": True}))  # must not raise
-
-
-def test_check_response_includes_detail_from_json_body():
-    resp = _response(422, json={"detail": "polygon must be in EPSG:4326"})
-    with pytest.raises(httpx.HTTPStatusError, match="polygon must be in EPSG:4326"):
-        _check_response(resp)
-
-
-def test_check_response_falls_back_when_body_is_not_json():
-    resp = httpx.Response(
-        500, text="internal server error", request=httpx.Request("GET", "https://example.test/")
-    )
-    with pytest.raises(httpx.HTTPStatusError):
-        _check_response(resp)

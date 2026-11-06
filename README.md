@@ -72,15 +72,23 @@ tools — one `GET .../{id}`, one `GET .../metadata`, and one
 
 **Task management:**
 
+- **`wait_for_tasks`** — resolves many task ids in one call (describe by
+  default, or result); waits run concurrently server-side, so a batch
+  takes as long as its slowest task. Per-task failures are returned under
+  that id instead of failing the batch.
 - **`wait_for_task`** — many endpoints (concepts, analyses, async source
   fetches) return a `task_id` instead of a result. This polls
   `GET /task/{id}` until it's `done`/`failed` and returns the result in one
-  call, instead of the caller manually re-polling turn after turn. A single
-  slow poll doesn't fail the whole call — retried on the next tick, still
-  bounded by `max_wait` — since the shared HTTP client's timeout (10s
-  connect / 60s read; observed necessary for `/describe` and `/result` on
-  large datasets) can still occasionally be hit by one request without the
-  task itself having failed.
+  call, instead of the caller manually re-polling turn after turn. Polling
+  starts at 0.3s and backs off to `poll_interval`. A failed task is
+  reported with its error and left for `delete_task` (the wait tools are
+  read-only); a task still running at `max_wait` can simply be waited on
+  again — the API refuses to delete queued/running tasks. The API answers
+  a failed task's status with HTTP 500 and `status: failed` in the body;
+  the poller and `manage_task(view="status")` read the body first.
+- The GET `concept_*` tools wait for their `task_id_*` inputs themselves
+  (a middleware polls them under one deadline), so a fetch → buffer →
+  sjoin chain can be fired back to back without a `wait_for_task` per hop.
 - **`manage_task`** — the four `GET /task/{id}(/*)` reads
   (`status`/`describe`/`metadata`/`result`) behind one `view` argument.
   Deletion is deliberately not a `view` here — it stays the auto-generated
@@ -114,16 +122,28 @@ which for this API's FastAPI-generated spec repeats the function name and
 path (`get_task_concept_overlay_concept_overlay_get`). Every session that
 connects pays for tool-name length, so this isn't just cosmetic. Where an
 operation has both a GET (task_id-chaining) and POST (live-entity) form —
-`concept_closest`, `concept_density_area`, `concept_density_count` — the GET
-one keeps the plain name, since it's the one this server's skill recommends
-by default; POST gets a `_from_entity` suffix.
+`concept_closest`, `concept_density_area`, `concept_density_count` — only
+the GET one is exposed: it's the one the skill recommends, and each POST
+schema was another 2-3k chars on every session's tool listing. The
+"fetch all pages via response headers" recipe upstream appends to every
+description is stripped for the same reason.
 
 **A quirk worth knowing, not a bug:** the auto-generated `concept_aggregation`
-and `concept_difference_area` tools work correctly, but their `geojson`
-parameter is misleadingly named — pass `{"geojson_list": [...]}` as its
-value, not a bare FeatureCollection. The requestBody schema's `"title"` says
-"Geojson" (which FastMCP uses to name the flattened parameter), but the
-schema it actually `$ref`s is `GeoJsonList`.
+and `concept_difference_area` tools take `geojson_list` — a *list* of
+FeatureCollections (`[{"type": "FeatureCollection", "features": [...]}]`),
+not one bare FeatureCollection. (Older FastMCP versions flattened this
+parameter under the misleading name `geojson`; with fastmcp >= 3.4.6 the
+schema names it `geojson_list` directly.)
+
+## Layout
+
+- `spec.py` — loads/caches `openapi.json` (keyed by base URL, atomic
+  write, stale copy used when the API is down), decides which operations
+  become tools, derives the source-entity registry.
+- `client.py` — the retrying httpx client, error text and hints, task
+  status/polling.
+- `server.py` — the hand-written tools, middlewares, and CLI.
+- `agent.py` — the orchestrator-side client.
 
 ## Setup
 
@@ -148,13 +168,13 @@ this is what an MCP client actually launches):
 
 ```bash
 uv run signaleyes-mcp            # serve over stdio (default)
-uv run signaleyes-mcp test       # run the test suite (uv run pytest, equivalently)
+uv run signaleyes-mcp serve --transport http --port 8000
 uv run signaleyes-mcp smoke      # one real query against SignalEyes, to sanity-check credentials/setup
 uv run signaleyes-mcp smoke --entity tree --polygon "POLYGON ((...))"
 ```
 
-`smoke` needs `SIGNALEYES_USERNAME`/`PASSWORD` set (it hits the live API);
-`test` doesn't (everything but `test_live_spec.py` is mocked).
+`smoke` needs `SIGNALEYES_USERNAME`/`PASSWORD` set (it hits the live API).
+The test suite is `uv run pytest` (everything but `test_live_spec.py` is mocked).
 
 ## Register with an MCP client
 
@@ -198,6 +218,76 @@ option, not the expensive one.
 }
 ```
 
+## Orchestrator / multi-agent use
+
+This server is meant to be one specialist in an agent orchestrator, not a
+chatbot with 90+ near-duplicate tools.
+
+**stdio** — one client, one process (Claude Code, Copilot, a single worker).
+
+**Streamable HTTP** — several agents sharing one server:
+
+```bash
+uv run signaleyes-mcp serve --transport http --host 127.0.0.1 --port 8000
+```
+
+Then point workers at `http://127.0.0.1:8000/mcp`. HTTP runs **stateless**
+(no session affinity), so concurrent workers can share one process. In Python:
+
+```python
+from signaleyes_mcp import bind, call_tool, call_tools, connect
+
+async with connect("http://127.0.0.1:8000/mcp") as client:
+    skill, tools = await bind(client)  # load this before the first tool call
+    entities = await call_tool(client, "list_source_entities", {})
+    if not entities.ok:
+        # entities.retryable / entities.hint tell the agent whether to retry
+        ...
+    # independent reads can fan out:
+    pages = await call_tools(
+        client,
+        [
+            ("get_objects_metadata", {"entity": "tree"}),
+            ("get_objects_metadata", {"entity": "building"}),
+        ],
+    )
+```
+
+`call_tool` returns a `ToolOutcome` (`ok`, `data`, `error`, `retryable`,
+`hint`) instead of raising on a 4xx/5xx from the API — the specialist agent
+can put that back in context and recover. FastMCP already injects W3C
+`traceparent` into MCP `_meta`, so a Langfuse/OpenTelemetry span on the
+orchestrator links to this server's spans. Configure an OTEL exporter in the
+orchestrator process (no extra dependency here), for example Langfuse's
+OTLP endpoint.
+
+`bind` is the current pattern for teaching a specialist agent the workflow
+without stuffing it into every tool schema: discover → fetch or describe →
+wait for tasks → chain GET concepts. The same text is also exposed as MCP
+resource `skill://signaleyes/SKILL.md`. Every tool error — generated tools
+included — ends with a recovery hint and `[retryable=yes|no]`, decided once
+in `client.recovery_hint` and attached by a server middleware; `agent.py`
+parses that tag instead of keeping its own table.
+
+A FeatureCollection over `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES` (default
+50_000 — above that Claude Code moves the result to a file the model
+never sees inline) is trimmed to whole leading features and marked
+`truncated: true` / `total_features`, so it stays valid JSON;
+`fetch_all_pages` also stops paging once past the cap (and marks an early
+stop `truncated` without claiming a total). For counts/stats use
+`respond_async=True` then `manage_task(view="describe")` instead of pulling
+geometries.
+
+Retries live in `client.RetryingClient.send` (not a custom transport, so
+httpx keeps `HTTP(S)_PROXY`/`NO_PROXY` support): 429 always, connect
+errors and 502/503/504 only for requests that cannot create a task —
+`GET /concept/*`, `GET /analyses/*`, anything with `Prefer: respond-async`,
+and every POST are never re-sent. 500 is not retried: that is how the API
+reports a failed task.
+
+Read-only tools advertise `readOnlyHint`; `delete_task` advertises
+`destructiveHint`, so an orchestrator can allowlist the former.
+
 ## Configuration
 
 | Env var | Required | Default |
@@ -205,6 +295,8 @@ option, not the expensive one.
 | `SIGNALEYES_USERNAME` | yes | — |
 | `SIGNALEYES_PASSWORD` | yes | — |
 | `SIGNALEYES_BASE_URL` | no | `https://api.neo.nl/v1` |
+| `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES` | no | `50000` (set `0` to disable truncation) |
+| `SIGNALEYES_SPEC_CACHE` | no | `$XDG_CACHE_HOME/signaleyes-mcp/openapi-<base-url-hash>.json`, reused for 24h and as a fallback when the API is unreachable (set empty to disable) |
 
 Set `SIGNALEYES_BASE_URL=https://api-dev.neo.nl/v1` to point at the dev
 environment instead.
@@ -226,8 +318,9 @@ credentials needed, ~99% statement coverage:
   `post_large_polygon`, `whoami`, `get_object_by_id`, `post_objects_by_ids`,
   `get_objects_metadata`, `list_source_entities`, `manage_task` — including
   the registry's error paths (unknown entity, missing/unsupported variant).
-- `test_cli.py` — the `serve`/`test`/`smoke` argument parser, `run_tests`,
-  `run_smoke`, and `_check_response`'s detail-message extraction.
+- `test_client.py` — the retrying client's policy per request kind, error
+  tagging in both error formats, failed-task status behind a 500.
+- `test_cli.py` — the `serve`/`smoke` argument parser and `run_smoke`.
 - `test_main.py` — `main()`'s subcommand dispatch, env-var validation, and
   success path.
 

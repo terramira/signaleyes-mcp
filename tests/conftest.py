@@ -9,6 +9,12 @@ import pytest
 from spec_helpers import make_spec, op
 
 
+@pytest.fixture(autouse=True)
+def no_spec_cache(monkeypatch):
+    """Tests mock httpx.get; an on-disk spec cache would bypass that mock."""
+    monkeypatch.setenv("SIGNALEYES_SPEC_CACHE", "")
+
+
 @pytest.fixture
 def fake_spec() -> dict:
     """A small spec covering every route-map branch build_server has to handle.
@@ -62,6 +68,26 @@ def fake_spec() -> dict:
             "/source/agriparcel/{id}": {"get": op("get_agriparcel_by_id", ("id",))},
             "/source/agriparcel/metadata": {"get": op("get_agriparcel_metadata")},
             "/source/agriparcel/batch": {"post": op("post_agriparcel_batch")},
+            "/source/bag": {"get": op("get_bag"), "post": op("post_bag")},
+            "/source/tree": {"get": op("get_tree"), "post": op("post_tree")},
+            "/source/tree/{entity}": {
+                "get": op("get_tree_entity", ("entity",)),
+                "post": op("post_tree_entity", ("entity",)),
+            },
+            "/source/thirdparty/{identifier}": {
+                "get": op("get_thirdparty", ("identifier",)),
+            },
+            "/source/thirdparty/{identifier}/arrow": {
+                "get": op("get_thirdparty_arrow", ("identifier",)),
+            },
+            "/concept/closest": {
+                "get": op(
+                    "get_task_concept_closest_concept_closest_get",
+                    description="Find closest.\n\nThe data is delivered in pages.\n\nFetch all.",
+                    query_params=("task_id_primary_entity", "task_id_secondary_entity"),
+                ),
+                "post": op("post_closest"),
+            },
             "/task/{task_id}": {
                 "get": op("get_task", ("task_id",)),
                 "delete": op("delete_task", ("task_id",)),
@@ -97,6 +123,7 @@ def spy_async_client(monkeypatch):
         captured["base_url"] = kwargs.get("base_url")
         captured["auth"] = kwargs.get("auth")
         captured["timeout"] = kwargs.get("timeout")
+        captured["transport"] = kwargs.get("transport")
         real_init(self, *args, **kwargs)
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", spying_init)

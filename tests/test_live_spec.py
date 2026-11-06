@@ -40,3 +40,6 @@ def test_build_server_generates_tools():
         "post_large_polygon",
     ):
         assert consolidated in names, f"expected consolidated tool {consolidated!r}"
+
+    resources = asyncio.run(server.list_resources())
+    assert any(str(r.uri).startswith("skill://signaleyes/") for r in resources)
