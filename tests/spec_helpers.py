@@ -18,7 +18,10 @@ _VARIANT_ENUMS = {"entity": ["detail", "surrounding"]}
 
 
 def op(
-    operation_id: str, path_params: tuple[str, ...] = (), description: str | None = None
+    operation_id: str,
+    path_params: tuple[str, ...] = (),
+    description: str | None = None,
+    query_params: tuple[str, ...] = (),
 ) -> dict:
     return {
         "operationId": operation_id,
@@ -34,6 +37,7 @@ def op(
                 },
             }
             for p in path_params
-        ],
+        ]
+        + [{"name": q, "in": "query", "schema": {"type": "string"}} for q in query_params],
         "responses": {"200": {"description": "ok"}},
     }

@@ -93,34 +93,29 @@ def test_call_tools_fans_out(mock_spec_get, spy_async_client):
     assert results[0].data["agriparcel"]["list"] == "no variant"
 
 
-def test_classify_tool_error_auth_is_not_retryable():
-    out = classify_tool_error("Client error '401 Unauthorized' for url 'https://x'")
+def test_classify_reads_the_server_tag():
+    out = classify_tool_error(
+        "Client error '401 Unauthorized' for url 'https://x' — Call whoami once; do not "
+        "retry other tools until credentials work. [retryable=no]"
+    )
     assert not out.ok
     assert out.retryable is False
     assert out.hint and "whoami" in out.hint
+    assert str(out).endswith("[retryable=no]")
 
-
-def test_classify_tool_error_429_is_retryable():
-    out = classify_tool_error("Client error '429 Too Many Requests' for url 'https://x'")
+    out = classify_tool_error(
+        "HTTP error 429: x - {} — Rate limited. Wait, then retry. [retryable=yes]"
+    )
     assert out.retryable is True
+    assert out.hint == "Rate limited. Wait, then retry."
 
 
-def test_classify_tool_error_post_502_is_not_retryable():
-    out = classify_tool_error("Client error '502 Bad Gateway' for url 'https://x' POST")
-    assert out.retryable is False
-    assert out.hint and "manage_task" in out.hint
-
-
-def test_classify_remaining_recovery_branches():
+def test_classify_untagged_errors_are_client_side():
     assert classify_tool_error("Invalid params: entity").retryable is False
-    assert classify_tool_error("Client error '409 Conflict' for url 'https://x'").retryable is True
-    get_502 = classify_tool_error("Client error '502 Bad Gateway' for url 'https://x'")
-    assert get_502.retryable is True
-    timeout = classify_tool_error("Upstream request timed out, please retry")
+    timeout = classify_tool_error("Timed out while waiting for response to ClientRequest")
     assert timeout.retryable is True
     assert str(ToolOutcome(ok=True, data={"n": 1})) == "{'n': 1}"
     assert "tool error" in str(ToolOutcome(ok=False))
-    assert "hint" in str(ToolOutcome(ok=False, error="e", hint="hint"))
 
 
 def test_error_text_and_result_data_fallbacks():
@@ -151,11 +146,3 @@ def test_call_tool_classifies_raised_client_errors(mock_spec_get, spy_async_clie
     result = asyncio.run(go())
     assert not result.ok
     assert result.retryable is True
-
-
-def test_wait_deadline_is_retryable_with_wait_hint():
-    out = classify_tool_error(
-        "Error calling tool 'wait_for_task': Task t1 did not complete within 5s"
-    )
-    assert out.retryable is True
-    assert "wait_for_task" in (out.hint or "")

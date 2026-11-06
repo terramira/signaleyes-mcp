@@ -43,10 +43,6 @@ you only need counts or attribute stats.
 
 ## Errors
 
-Tool errors include the API `detail` and a recovery hint.
-- 401/403 → `whoami` once, then stop other tools until credentials work.
-- 422 → fix the arguments; do not retry the same call.
-- 429 → wait, then retry.
-- POST 502/503/504 → do not re-POST (a task may already exist); `manage_task`.
-Transient GET 429/5xx is retried by the server — wait for that rather than
-re-issuing immediately.
+Every tool error ends with a recovery hint and `[retryable=yes|no]`. Follow
+the hint; retry only when it says yes. A failed task is reported, not
+deleted — `delete_task(id)` cleans it up if the user wants that.

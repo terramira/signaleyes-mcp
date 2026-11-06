@@ -7,7 +7,7 @@ import pytest
 from spec_helpers import make_spec, op
 
 from signaleyes_mcp import build_server
-from signaleyes_mcp.server import MCP_NAMES
+from signaleyes_mcp.spec import MCP_NAMES
 
 
 def _task_response(task_id: str, status: str, error: str | None = None) -> httpx.Response:
@@ -116,7 +116,7 @@ def test_list_source_entities_reports_variant_enums(mock_spec_get, spy_async_cli
 
 
 def test_concept_call_waits_for_queued_input_tasks(
-    mock_spec_get, spy_async_client, async_client_get_queue, fast_sleep
+    mock_spec_get, spy_async_client, async_client_get_queue, fast_sleep, monkeypatch
 ):
     from types import SimpleNamespace
 
@@ -124,13 +124,14 @@ def test_concept_call_waits_for_queued_input_tasks(
 
     server = build_server("https://example.test/v1", "user", "pass")
     mw = next(m for m in server.middleware if isinstance(m, _AwaitInputTasks))
-    async_client_get_queue.responses.extend(
-        [
-            _task_response("a", "queued"),
-            _task_response("a", "done"),
-            _task_response("b", "done"),
-        ]
-    )
+    state = {"a": iter(["queued", "done"]), "b": iter(["done"])}
+
+    async def fake_get(self, url, **kwargs):
+        async_client_get_queue.calls.append({"url": url})
+        task = url.rsplit("/", 1)[1]
+        return _task_response(task, next(state[task]))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
     forwarded = []
 
     async def call_next(ctx):
@@ -139,11 +140,16 @@ def test_concept_call_waits_for_queued_input_tasks(
 
     ctx = SimpleNamespace(
         message=SimpleNamespace(
-            arguments={"task_id_primary_entity": "a", "task_id_secondary_entity": "b", "radius": 1}
+            name="concept_closest",
+            arguments={"task_id_primary_entity": "a", "task_id_secondary_entity": "b", "radius": 1},
         )
     )
     assert asyncio.run(mw.on_call_tool(ctx, call_next)) == "result"
-    assert [c["url"] for c in async_client_get_queue.calls] == ["/task/a", "/task/a", "/task/b"]
+    assert sorted(c["url"] for c in async_client_get_queue.calls) == [
+        "/task/a",
+        "/task/a",
+        "/task/b",
+    ]
     assert forwarded == [ctx]
 
 
@@ -159,7 +165,9 @@ def test_concept_call_surfaces_failed_input_task(
     server = build_server("https://example.test/v1", "user", "pass")
     mw = next(m for m in server.middleware if isinstance(m, _AwaitInputTasks))
     async_client_get_queue.responses.append(_task_response("a", "failed", "boom"))
-    ctx = SimpleNamespace(message=SimpleNamespace(arguments={"task_id_primary_entity": "a"}))
+    ctx = SimpleNamespace(
+        message=SimpleNamespace(name="concept_closest", arguments={"task_id_primary_entity": "a"})
+    )
 
     async def call_next(ctx):
         raise AssertionError("must not forward")
@@ -368,11 +376,14 @@ def test_spec_fetch_http_error_propagates(monkeypatch):
         build_server("https://example.test/v1", "user", "pass")
 
 
-def test_client_uses_retry_transport(mock_spec_get, spy_async_client):
-    from signaleyes_mcp.server import _RetryTransport
+def test_client_is_the_retrying_client_with_default_transport(mock_spec_get, spy_async_client):
+    from signaleyes_mcp.client import RetryingClient
 
-    build_server("https://example.test/v1", "user", "pass")
-    assert isinstance(spy_async_client["transport"], _RetryTransport)
+    server = build_server("https://example.test/v1", "user", "pass")
+    client = next(m for m in server.middleware if hasattr(m, "_client"))._client
+    assert isinstance(client, RetryingClient)
+    # No custom transport: httpx keeps HTTP(S)_PROXY / NO_PROXY support.
+    assert spy_async_client["transport"] is None
 
 
 def test_exposes_signaleyes_skill_resource(mock_spec_get, spy_async_client):
@@ -393,3 +404,59 @@ def test_tools_carry_read_vs_destructive_annotations(mock_spec_get, spy_async_cl
     assert tools["post_large_polygon"].annotations.readOnlyHint is False
     assert tools["delete_task"].annotations is not None
     assert tools["delete_task"].annotations.destructiveHint is True
+
+
+def test_concept_middleware_ignores_tools_without_task_inputs(mock_spec_get, spy_async_client):
+    from types import SimpleNamespace
+
+    from signaleyes_mcp.server import _AwaitInputTasks
+
+    server = build_server("https://example.test/v1", "user", "pass")
+    mw = next(m for m in server.middleware if isinstance(m, _AwaitInputTasks))
+    ctx = SimpleNamespace(
+        message=SimpleNamespace(name="fetch_all_pages", arguments={"task_id_primary_entity": "a"})
+    )
+
+    async def call_next(ctx):
+        return "forwarded without polling"
+
+    assert asyncio.run(mw.on_call_tool(ctx, call_next)) == "forwarded without polling"
+
+
+def test_generated_tool_errors_are_tagged(mock_spec_get, spy_async_client, async_client_get_queue):
+    """The tag middleware wraps every tool, so the orchestrator never parses error prose."""
+    server = build_server("https://example.test/v1", "user", "pass")
+    async_client_get_queue.responses.append(
+        httpx.Response(
+            409,
+            json={"detail": "Task x is not done yet"},
+            request=httpx.Request("GET", "https://example.test/"),
+        )
+    )
+    with pytest.raises(Exception, match=r"wait_for_task\. \[retryable=yes\]$"):
+        asyncio.run(server.call_tool("manage_task", {"task_id": "x", "view": "result"}))
+
+
+def test_spec_cache_is_keyed_by_base_url_and_survives_corruption(monkeypatch, tmp_path, fake_spec):
+    import json
+
+    from signaleyes_mcp.spec import _cache_path, load_spec
+
+    monkeypatch.delenv("SIGNALEYES_SPEC_CACHE", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    a, b = _cache_path("https://a.test/v1"), _cache_path("https://b.test/v1")
+    assert a != b and a.parent == b.parent
+
+    calls = []
+
+    def fake_get(url, timeout=None):
+        calls.append(url)
+        return httpx.Response(200, json=fake_spec, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    load_spec("https://a.test/v1")
+    assert json.loads(a.read_text()) == fake_spec
+    a.write_text("{truncated")
+    load_spec("https://a.test/v1")  # corrupt cache is a miss, not a crash
+    assert len(calls) == 2
+    assert json.loads(a.read_text()) == fake_spec

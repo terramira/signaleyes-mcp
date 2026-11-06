@@ -79,12 +79,16 @@ tools — one `GET .../{id}`, one `GET .../metadata`, and one
 - **`wait_for_task`** — many endpoints (concepts, analyses, async source
   fetches) return a `task_id` instead of a result. This polls
   `GET /task/{id}` until it's `done`/`failed` and returns the result in one
-  call, instead of the caller manually re-polling turn after turn. A single
-  slow poll doesn't fail the whole call — retried on the next tick, still
-  bounded by `max_wait` — since the shared HTTP client's timeout (10s
-  connect / 60s read; observed necessary for `/describe` and `/result` on
-  large datasets) can still occasionally be hit by one request without the
-  task itself having failed.
+  call, instead of the caller manually re-polling turn after turn. Polling
+  starts at 0.3s and backs off to `poll_interval`. A failed task is
+  reported with its error and left for `delete_task` (the wait tools are
+  read-only); a task still running at `max_wait` can simply be waited on
+  again — the API refuses to delete queued/running tasks. The API answers
+  a failed task's status with HTTP 500 and `status: failed` in the body;
+  the poller and `manage_task(view="status")` read the body first.
+- The GET `concept_*` tools wait for their `task_id_*` inputs themselves
+  (a middleware polls them under one deadline), so a fetch → buffer →
+  sjoin chain can be fired back to back without a `wait_for_task` per hop.
 - **`manage_task`** — the four `GET /task/{id}(/*)` reads
   (`status`/`describe`/`metadata`/`result`) behind one `view` argument.
   Deletion is deliberately not a `view` here — it stays the auto-generated
@@ -131,6 +135,16 @@ not one bare FeatureCollection. (Older FastMCP versions flattened this
 parameter under the misleading name `geojson`; with fastmcp >= 3.4.6 the
 schema names it `geojson_list` directly.)
 
+## Layout
+
+- `spec.py` — loads/caches `openapi.json` (keyed by base URL, atomic
+  write, stale copy used when the API is down), decides which operations
+  become tools, derives the source-entity registry.
+- `client.py` — the retrying httpx client, error text and hints, task
+  status/polling.
+- `server.py` — the hand-written tools, middlewares, and CLI.
+- `agent.py` — the orchestrator-side client.
+
 ## Setup
 
 Requires [uv](https://docs.astral.sh/uv/).
@@ -155,13 +169,12 @@ this is what an MCP client actually launches):
 ```bash
 uv run signaleyes-mcp            # serve over stdio (default)
 uv run signaleyes-mcp serve --transport http --port 8000
-uv run signaleyes-mcp test       # run the test suite (uv run pytest, equivalently)
 uv run signaleyes-mcp smoke      # one real query against SignalEyes, to sanity-check credentials/setup
 uv run signaleyes-mcp smoke --entity tree --polygon "POLYGON ((...))"
 ```
 
-`smoke` needs `SIGNALEYES_USERNAME`/`PASSWORD` set (it hits the live API);
-`test` doesn't (everything but `test_live_spec.py` is mocked).
+`smoke` needs `SIGNALEYES_USERNAME`/`PASSWORD` set (it hits the live API).
+The test suite is `uv run pytest` (everything but `test_live_spec.py` is mocked).
 
 ## Register with an MCP client
 
@@ -173,6 +186,20 @@ claude mcp add signaleyes-mcp \
   --env SIGNALEYES_PASSWORD=your_password \
   -- uv run --directory /path/to/signaleyes-mcp signaleyes-mcp
 ```
+
+Also copy `.claude/skills/signaleyes-mcp/` from this repo into your own
+project's `.claude/skills/` if you're using Claude Code. Tool schemas
+cover what each tool takes; the skill covers what they don't — the async
+`task_id` pattern almost every real call goes through, and reusable
+fetch → buffer → overlay/sjoin patterns for compound questions like "what's
+within N meters of X". A well-documented MCP server and a skill aren't
+either/or: MCP gives an agent *access*, a skill gives it *judgment* about
+how to use that access well — see [Anthropic's Agent Skills
+writeup](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
+for the general case. An unused skill costs only its `name`/`description`
+in context (~100 tokens) until Claude decides it's relevant, so adding one
+alongside a lean tool set — rather than instead of one — is the cheap
+option, not the expensive one.
 
 **GitHub Copilot CLI** — add to `~/.copilot/mcp-config.json`:
 
@@ -234,18 +261,26 @@ OTLP endpoint.
 `bind` is the current pattern for teaching a specialist agent the workflow
 without stuffing it into every tool schema: discover → fetch or describe →
 wait for tasks → chain GET concepts. The same text is also exposed as MCP
-resource `skill://signaleyes/SKILL.md`. Tool errors include a recovery hint
-(401 → `whoami`; 422 → fix args, don't retry; POST 502 → don't re-fire,
-check `manage_task`).
+resource `skill://signaleyes/SKILL.md`. Every tool error — generated tools
+included — ends with a recovery hint and `[retryable=yes|no]`, decided once
+in `client.recovery_hint` and attached by a server middleware; `agent.py`
+parses that tag instead of keeping its own table.
 
 A FeatureCollection over `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES` (default
 50_000 — above that Claude Code moves the result to a file the model
 never sees inline) is trimmed to whole leading features and marked
 `truncated: true` / `total_features`, so it stays valid JSON;
-`fetch_all_pages` also stops paging once past the cap. For counts/stats use `respond_async=True` then
-`manage_task(view="describe")` instead of pulling geometries. Transient
-GET 429/502/503/504 and connect failures are retried on the HTTP client;
-POST 502 is not, so a concept/task create is not double-fired.
+`fetch_all_pages` also stops paging once past the cap (and marks an early
+stop `truncated` without claiming a total). For counts/stats use
+`respond_async=True` then `manage_task(view="describe")` instead of pulling
+geometries.
+
+Retries live in `client.RetryingClient.send` (not a custom transport, so
+httpx keeps `HTTP(S)_PROXY`/`NO_PROXY` support): 429 always, connect
+errors and 502/503/504 only for requests that cannot create a task —
+`GET /concept/*`, `GET /analyses/*`, anything with `Prefer: respond-async`,
+and every POST are never re-sent. 500 is not retried: that is how the API
+reports a failed task.
 
 Read-only tools advertise `readOnlyHint`; `delete_task` advertises
 `destructiveHint`, so an orchestrator can allowlist the former.
@@ -258,7 +293,7 @@ Read-only tools advertise `readOnlyHint`; `delete_task` advertises
 | `SIGNALEYES_PASSWORD` | yes | — |
 | `SIGNALEYES_BASE_URL` | no | `https://api.neo.nl/v1` |
 | `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES` | no | `50000` (set `0` to disable truncation) |
-| `SIGNALEYES_SPEC_CACHE` | no | `$XDG_CACHE_HOME/signaleyes-mcp/openapi.json`, reused for 24h and as a fallback when the API is unreachable (set empty to disable) |
+| `SIGNALEYES_SPEC_CACHE` | no | `$XDG_CACHE_HOME/signaleyes-mcp/openapi-<base-url-hash>.json`, reused for 24h and as a fallback when the API is unreachable (set empty to disable) |
 
 Set `SIGNALEYES_BASE_URL=https://api-dev.neo.nl/v1` to point at the dev
 environment instead.
@@ -280,8 +315,9 @@ credentials needed, ~99% statement coverage:
   `post_large_polygon`, `whoami`, `get_object_by_id`, `post_objects_by_ids`,
   `get_objects_metadata`, `list_source_entities`, `manage_task` — including
   the registry's error paths (unknown entity, missing/unsupported variant).
-- `test_cli.py` — the `serve`/`test`/`smoke` argument parser, `run_tests`,
-  `run_smoke`, and `_check_response`'s detail-message extraction.
+- `test_client.py` — the retrying client's policy per request kind, error
+  tagging in both error formats, failed-task status behind a 500.
+- `test_cli.py` — the `serve`/`smoke` argument parser and `run_smoke`.
 - `test_main.py` — `main()`'s subcommand dispatch, env-var validation, and
   success path.
 

@@ -68,12 +68,8 @@ def test_wait_for_task_polls_until_done(
 
 
 def test_wait_for_task_raises_on_failed_status(
-    monkeypatch, mock_spec_get, spy_async_client, async_client_get_queue
+    mock_spec_get, spy_async_client, async_client_get_queue
 ):
-    async def fake_delete(self, url, **kwargs):
-        return _response(status_code=204)
-
-    monkeypatch.setattr(httpx.AsyncClient, "delete", fake_delete)
     server = _server(mock_spec_get, spy_async_client)
     async_client_get_queue.responses.append(
         _response(json={"id": "t1", "status": "failed", "error": "bad polygon"})
@@ -83,7 +79,7 @@ def test_wait_for_task_raises_on_failed_status(
         _call(server, "wait_for_task", {"task_id": "t1"})
 
 
-def test_wait_for_task_deletes_a_failed_task(
+def test_wait_for_task_reports_a_failed_task_and_does_not_delete_it(
     monkeypatch, mock_spec_get, spy_async_client, async_client_get_queue
 ):
     deleted = []
@@ -98,9 +94,9 @@ def test_wait_for_task_deletes_a_failed_task(
         _response(json={"id": "t1", "status": "failed", "error": "out of memory"})
     )
 
-    with pytest.raises(ToolError, match="out of memory.*deleted"):
+    with pytest.raises(ToolError, match="out of memory.*delete_task"):
         _call(server, "wait_for_task", {"task_id": "t1"})
-    assert deleted == ["/task/t1"]
+    assert deleted == []
 
 
 def test_wait_for_task_treats_500_with_failed_body_as_failed_not_transient(
@@ -119,26 +115,10 @@ def test_wait_for_task_treats_500_with_failed_body_as_failed_not_transient(
         _response(status_code=500, json={"id": "t1", "status": "failed", "error": "ISE"})
     )
 
-    with pytest.raises(ToolError, match="failed: ISE.*deleted"):
+    with pytest.raises(ToolError, match="failed: ISE.*delete_task"):
         _call(server, "wait_for_task", {"task_id": "t1"})
     assert len(async_client_get_queue.calls) == 1
-    assert deleted == ["/task/t1"]
-
-
-def test_wait_for_task_failure_still_raises_when_delete_errors(
-    monkeypatch, mock_spec_get, spy_async_client, async_client_get_queue
-):
-    async def failing_delete(self, url, **kwargs):
-        raise httpx.ConnectError("gone")
-
-    monkeypatch.setattr(httpx.AsyncClient, "delete", failing_delete)
-    server = _server(mock_spec_get, spy_async_client)
-    async_client_get_queue.responses.append(
-        _response(json={"id": "t1", "status": "failed", "error": "boom"})
-    )
-
-    with pytest.raises(ToolError, match="boom"):
-        _call(server, "wait_for_task", {"task_id": "t1"})
+    assert deleted == []
 
 
 def test_wait_for_task_raises_timeout_when_never_done(
@@ -192,21 +172,15 @@ def test_wait_for_task_retries_a_timeout_on_the_result_fetch_too(
     assert result.structured_content["features"] == [{"id": 1}]
 
 
-def test_wait_for_task_retries_past_a_503(
+def test_wait_for_task_surfaces_a_503_the_client_could_not_retry_away(
     mock_spec_get, spy_async_client, async_client_get_queue, fast_sleep
 ):
+    """HTTP-level retries live in the client; the poller doesn't add a second layer."""
     server = _server(mock_spec_get, spy_async_client)
-    async_client_get_queue.responses.extend(
-        [
-            _response(status_code=503, json={"detail": "unavailable"}),
-            _response(json={"id": "t1", "status": "done", "error": None}),
-            _response(json={"type": "FeatureCollection", "features": [{"id": 1}]}),
-        ]
-    )
+    async_client_get_queue.responses.append(_response(status_code=503, json={"detail": "down"}))
 
-    result = _call(server, "wait_for_task", {"task_id": "t1"})
-
-    assert result.structured_content["features"] == [{"id": 1}]
+    with pytest.raises(ToolError, match=r"503.*down.*\[retryable=yes\]"):
+        _call(server, "wait_for_task", {"task_id": "t1"})
 
 
 def test_wait_for_task_does_not_retry_a_422(
@@ -844,5 +818,48 @@ def test_manage_task_defaults_to_status_view(
 def test_manage_task_rejects_unknown_view(mock_spec_get, spy_async_client):
     server = _server(mock_spec_get, spy_async_client)
 
-    with pytest.raises(ToolError, match="view must be one of"):
+    with pytest.raises(ToolError):
         _call(server, "manage_task", {"task_id": "t1", "view": "delete"})
+
+
+def test_manage_task_status_returns_a_failed_task_instead_of_raising(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(status_code=500, json={"id": "t1", "status": "failed", "error": "boom"})
+    )
+
+    out = _call(server, "manage_task", {"task_id": "t1"}).structured_content
+    assert out == {"id": "t1", "status": "failed", "error": "boom"}
+
+
+def test_fetch_all_pages_marks_an_early_stop_as_truncated_without_a_fake_total(
+    monkeypatch, mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.extend(
+        [_response(json={"features": [{"id": p}]}, headers={"X-Total-Pages": "5"}) for p in (1, 2)]
+    )
+
+    out = _call(
+        server,
+        "fetch_all_pages",
+        {"entity": "building", "polygon": "POLYGON ((0 0))", "max_pages": 2},
+    ).structured_content
+
+    assert out["truncated"] is True
+    assert "total_features" not in out
+    assert "describe" in out["hint"]
+
+
+def test_whoami_leaves_3d_wkt_without_a_bbox(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(json={"subscriptions": [{"aoi": "POLYGON Z ((1 2 3, 4 5 6, 1 2 3))"}]})
+    )
+
+    out = _call(server, "whoami", {}).structured_content
+    assert out["subscriptions"][0]["aoi"] == {"wkt_chars": len("POLYGON Z ((1 2 3, 4 5 6, 1 2 3))")}

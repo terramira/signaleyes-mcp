@@ -84,6 +84,7 @@ def fake_spec() -> dict:
                 "get": op(
                     "get_task_concept_closest_concept_closest_get",
                     description="Find closest.\n\nThe data is delivered in pages.\n\nFetch all.",
+                    query_params=("task_id_primary_entity", "task_id_secondary_entity"),
                 ),
                 "post": op("post_closest"),
             },

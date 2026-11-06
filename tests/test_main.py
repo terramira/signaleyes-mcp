@@ -162,29 +162,6 @@ def test_real_environment_variable_takes_precedence_over_dotenv(clean_env, monke
     fake_build.assert_called_once_with("https://api.neo.nl/v1", "explicit-user", "explicit-pw")
 
 
-# --- `test` subcommand -------------------------------------------------------
-
-
-def test_test_subcommand_does_not_require_credentials(clean_env, monkeypatch):
-    fake_run_tests = MagicMock(return_value=0)
-    monkeypatch.setattr(signaleyes_mcp, "run_tests", fake_run_tests)
-
-    with pytest.raises(SystemExit) as exc:
-        signaleyes_mcp.main(["test"])
-
-    fake_run_tests.assert_called_once_with()
-    assert exc.value.code == 0
-
-
-def test_test_subcommand_propagates_pytest_exit_code(clean_env, monkeypatch):
-    monkeypatch.setattr(signaleyes_mcp, "run_tests", MagicMock(return_value=3))
-
-    with pytest.raises(SystemExit) as exc:
-        signaleyes_mcp.main(["test"])
-
-    assert exc.value.code == 3
-
-
 # --- `smoke` subcommand -------------------------------------------------------
 
 
