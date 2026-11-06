@@ -244,10 +244,13 @@ async with connect("http://127.0.0.1:8000/mcp") as client:
         # entities.retryable / entities.hint tell the agent whether to retry
         ...
     # independent reads can fan out:
-    pages = await call_tools(client, [
-        ("get_objects_metadata", {"entity": "tree"}),
-        ("get_objects_metadata", {"entity": "building"}),
-    ])
+    pages = await call_tools(
+        client,
+        [
+            ("get_objects_metadata", {"entity": "tree"}),
+            ("get_objects_metadata", {"entity": "building"}),
+        ],
+    )
 ```
 
 `call_tool` returns a `ToolOutcome` (`ok`, `data`, `error`, `retryable`,
