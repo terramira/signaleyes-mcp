@@ -37,6 +37,8 @@ from signaleyes_mcp.client import (
     tag_error,
     task_status,
 )
+from signaleyes_mcp.exports import register_export_tools
+from signaleyes_mcp.external import register_external_tools
 from signaleyes_mcp.spec import (
     DESTRUCTIVE_OPEN,
     MCP_NAMES,
@@ -100,6 +102,18 @@ fetches, several concept submits) instead of one after another.
 Every tool error ends with a hint and [retryable=yes|no]; follow the hint.
 Only want counts/stats, not geometries? `manage_task(view="describe")`
 instead of pulling the full FeatureCollection into context.
+
+External WFS/OGC data: use the PDOK/OGC discovery MCP to find a service URL,
+then inspect_external_dataset and import_external_dataset with a selected
+WGS84 polygon. The import returns a task_id; poll manage_task(view="status")
+until done, then use existing concept_* tools and manage_task(view="describe").
+Use the configured SignalEyes account; do not ask for tokens in chat.
+
+Large results: export_task_file saves a completed task as local GeoJSON
+and returns only its path/count/size. The user can open that file in a GIS
+application. Do not return full geometries or credentials in chat.
+
+If a call fails with 401/403, run `whoami` first to confirm credentials.
 """
 
 
@@ -217,7 +231,12 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         mcp_component_fn=annotate_openapi_component,
     )
     mcp.add_provider(SkillProvider(_SKILLS_DIR / "signaleyes"))
-    write_tools = write_tool_names(spec) | {"post_large_polygon", "post_objects_by_ids"}
+    write_tools = write_tool_names(spec) | {
+        "post_large_polygon",
+        "post_objects_by_ids",
+        "import_external_dataset",
+        "export_task_file",
+    }
     mcp.add_middleware(_TagErrors(write_tools))
     mcp.add_middleware(_AwaitInputTasks(client, task_input_tools(spec)))
 
@@ -503,6 +522,9 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
             result["total_pages"] = int(resp.headers["X-Total-Pages"])
             result["page"] = int(resp.headers.get("X-Page-Number", page))
         return _bounded(result, max_bytes)
+
+    register_external_tools(mcp, client)
+    register_export_tools(mcp, client)
 
     @mcp.tool(annotations=READ_OPEN)
     async def whoami() -> dict[str, Any]:
