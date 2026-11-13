@@ -228,3 +228,106 @@ def test_crs84_bounds_remain_longitude_first():
 def test_wfs_rejects_layers_without_supported_geographic_crs():
     with pytest.raises(core.ExternalDataError, match="advertise"):
         core._wfs_spatial_params({"crs": ["EPSG:28992"]}, (4, 52, 5, 53))
+
+
+def test_wfs_download_pages_with_pdok_axis_order_and_provenance(monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+
+    capabilities = b"""<WFS_Capabilities version="2.0.0">
+      <FeatureTypeList><FeatureType><Name>demo:zones</Name>
+      <DefaultCRS>urn:ogc:def:crs:EPSG::4326</DefaultCRS>
+      <OutputFormats><Format>application/json</Format></OutputFormats>
+      </FeatureType></FeatureTypeList></WFS_Capabilities>"""
+    requests = []
+    pages = [
+        {
+            "type": "FeatureCollection",
+            "features": [feature()],
+            "numberMatched": "2",
+            "crs": {"properties": {"name": core.CRS84}},
+        },
+        {
+            "type": "FeatureCollection",
+            "features": [feature(4.6, 52.6, "two")],
+            "numberMatched": "2",
+        },
+    ]
+
+    class Reader:
+        def get(self, url):
+            return capabilities, {}
+
+        def json(self, url):
+            requests.append(parse_qs(urlsplit(url).query))
+            return pages.pop(0)
+
+    monkeypatch.setattr(core, "PublicReader", Reader)
+    result = core.download_source(BASE + "?service=WFS", "demo:zones", AREA)
+    assert result["complete"] and result["feature_count"] == 2
+    assert result["downloaded_count"] == 2
+    assert [query["startIndex"] for query in requests] == [["0"], ["1"]]
+    assert requests[0]["bbox"] == ["52.0,4.0,53.0,5.0,urn:ogc:def:crs:EPSG::4326"]
+    assert requests[0]["srsName"] == ["urn:ogc:def:crs:EPSG::4326"]
+    assert result["geojson"]["features"][1]["properties"]["_external_feature_id"] == "two"
+
+
+def test_ogc_discovery_autodetects_json_and_reports_catalog_pagination():
+    calls = []
+
+    def read_json(url):
+        calls.append(url)
+        return {
+            "collections": [{"id": "zones", "title": "Zones"}],
+            "links": [{"rel": "next", "href": "?page=2"}],
+        }
+
+    reader = SimpleNamespace(get=lambda url: (b'{"links": []}', {}), json=read_json)
+    result = core.inspect_source(BASE, reader=reader)
+    assert calls == [BASE + "/collections"]
+    assert result["protocol"] == "ogc_features"
+    assert result["layers"] == [{"id": "zones", "title": "Zones"}]
+    assert result["catalog_truncated"] is True
+
+
+@pytest.mark.parametrize(
+    "body,headers,message",
+    [
+        (
+            b'{"features": []}',
+            {"content-crs": "<http://www.opengis.net/def/crs/EPSG/0/28992>"},
+            "CRS84",
+        ),
+        (b"not JSON", {}, "valid GeoJSON/JSON"),
+        (b"[]", {}, "must be an object"),
+    ],
+)
+def test_public_reader_rejects_invalid_json_and_response_crs(monkeypatch, body, headers, message):
+    reader = core.PublicReader()
+    monkeypatch.setattr(reader, "get", lambda url: (body, headers))
+    with pytest.raises(core.ExternalDataError, match=message):
+        reader.json(BASE)
+
+
+def test_public_reader_accepts_crs84_json(monkeypatch):
+    reader = core.PublicReader()
+    monkeypatch.setattr(
+        reader, "get", lambda url: (b'{"features": []}', {"content-crs": core.CRS84})
+    )
+    assert reader.json(BASE) == {"features": []}
+
+
+def test_tls_uses_validated_ip_but_verifies_provider_hostname(monkeypatch):
+    from unittest.mock import Mock
+
+    sock = Mock()
+    context = Mock()
+    monkeypatch.setattr(core.ssl, "create_default_context", lambda: context)
+    monkeypatch.setattr(core.socket, "socket", lambda *args: sock)
+    connection = core._PinnedHTTPSConnection("provider.example", "8.8.8.8", 3)
+    connection.connect()
+    sock.connect.assert_called_once_with(("8.8.8.8", 443))
+    context.wrap_socket.assert_called_once_with(sock, server_hostname="provider.example")
+    context.wrap_socket.side_effect = OSError("TLS handshake failed")
+    with pytest.raises(OSError):
+        connection.connect()
+    sock.close.assert_called_once()
