@@ -90,7 +90,7 @@ def recovery_hint(status: int | None, read_only: bool, detail: str = "") -> str 
         )
     if status in (401, 403):
         return "Call whoami once; do not retry other tools until credentials work."
-    if status == 422:
+    if status in (400, 404, 422):
         return "Fix the arguments; do not retry the same call."
     if status == 429:
         return "Rate limited. Wait, then retry."
@@ -121,7 +121,7 @@ def tag_error(message: str, read_only: bool) -> str:
     """Append the hint and a machine-readable retryable marker to a tool error."""
     retryable, hint = error_outcome(message, read_only)
     if hint is None:
-        return message
+        return f"{message} [retryable=no]"
     return f"{message} — {hint} [retryable={'yes' if retryable else 'no'}]"
 
 

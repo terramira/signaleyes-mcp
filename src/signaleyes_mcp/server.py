@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import os
 import random
 import re
 import sys
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import httpx2
 from dotenv import load_dotenv
@@ -28,6 +29,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.server.providers.skills import SkillProvider
 from mcp.types import CallToolRequestParams
+from pydantic import Field
 
 from signaleyes_mcp.client import (
     TaskFailed,
@@ -63,6 +65,15 @@ _SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 # sees inline. Coordinate-heavy GeoJSON tokenizes at ~3 chars/token, so a
 # 95 KB result still went to file in testing; 50 KB stays inline.
 _DEFAULT_MAX_RESPONSE_BYTES = 50_000
+# A capped result is a shape preview, not data: the first 30 of 1700 polygons
+# cost 40 KB of context and answer nothing.
+_PREVIEW_FEATURES = 3
+# The API accepts an async fetch of any size and only fails the task later
+# with "exceeding the maximum number of pages (500)".
+_API_MAX_PAGES = 500
+_USAGE_MAX_ROWS = 50
+# Task ids (32 hex) and record ids (uuid) in a usage row's endpoint path.
+_ID_RE = re.compile(r"[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 
 # A small real area (Venlo, NL) known to have buildings/trees/roads, used by
 # `smoke` as a default query when the caller doesn't supply one.
@@ -146,7 +157,7 @@ def _bounded(result: dict[str, Any], max_bytes: int) -> dict[str, Any]:
     kept: list[Any] = []
     for feature in features:
         budget -= len(json.dumps(feature)) + 1
-        if budget < 0:
+        if budget < 0 or len(kept) == _PREVIEW_FEATURES:
             break
         kept.append(feature)
     return {
@@ -154,9 +165,62 @@ def _bounded(result: dict[str, Any], max_bytes: int) -> dict[str, Any]:
         "features": kept,
         "truncated": True,
         "total_features": result.get("total_features", len(features)),
-        "hint": "Result exceeded the size cap. Use respond_async=True then "
-        "manage_task(view='describe'), or geo_type='centroid' / simplify / filter_string.",
+        "hint": "Result exceeded the size cap; features are a preview only. Use "
+        "manage_task(view='describe') for stats (respond_async=True on a fetch), "
+        "export_task_file for the full data, or geo_type='centroid' / simplify / "
+        "filter_string to shrink it.",
     }
+
+
+def _slim_describe(described: dict[str, Any]) -> dict[str, Any]:
+    """Drop top-value lists of (near-)unique columns: ten ids with count 1 say nothing."""
+    for layer in described.values():
+        if not isinstance(layer, dict):
+            continue
+        total = layer.get("number_of_features", 0)
+        cats = layer.get("categorical_summary")
+        if not isinstance(cats, dict):
+            continue
+        for col, top in list(cats.items()):
+            if top and (max(top.values()) == 1 or sum(top.values()) < 0.1 * total):
+                del cats[col]
+    return described
+
+
+def _fold_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """One usage row per route: the API reports every /task/{id}/... path separately."""
+    folded: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        endpoint = _ID_RE.sub("{id}", row["endpoint"])
+        out = folded.setdefault(
+            (endpoint, row["request_type"]),
+            {
+                "endpoint": endpoint,
+                "request_type": row["request_type"],
+                "total_area_km2": 0.0,
+                "number_of_objects": 0,
+                "number_of_requests": 0,
+                "last_activity": "",
+            },
+        )
+        out["total_area_km2"] += float(row["total_area"].split()[0])
+        out["number_of_objects"] += row["number_of_objects"]
+        out["number_of_requests"] += row["number_of_requests"]
+        out["last_activity"] = max(out["last_activity"], row["last_activity"] or "")
+    ranked = sorted(folded.values(), key=lambda r: r["number_of_requests"], reverse=True)
+    result: dict[str, Any] = {"requests": ranked[:_USAGE_MAX_ROWS]}
+    if len(ranked) > _USAGE_MAX_ROWS:
+        result["omitted_rows"] = len(ranked) - _USAGE_MAX_ROWS
+    return result
+
+
+def _check_pages(resp: httpx2.Response) -> None:
+    pages = int(resp.headers.get("X-Total-Pages", 0))
+    if pages > _API_MAX_PAGES:
+        raise ToolError(
+            f"{pages} pages exceeds the API's limit of {_API_MAX_PAGES}; task "
+            f"{resp.json().get('id')} will fail. Narrow the polygon or add a filter_string."
+        )
 
 
 class _AwaitInputTasks(Middleware):
@@ -217,6 +281,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
     spec = load_spec(base_url)
     client = make_client(base_url, username, password)
     source_registry, source_variants, list_paths = build_source_registry(spec)
+    resolve = functools.partial(resolve_source_path, source_registry, variants=source_variants)
     max_bytes = int(
         os.environ.get("SIGNALEYES_MAX_TOOL_RESPONSE_BYTES", _DEFAULT_MAX_RESPONSE_BYTES)
     )
@@ -286,8 +351,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
                 await poll_until_done(client, task_id, max_wait)
                 resp = await client.get(f"/task/{task_id}/describe")
                 check_response(resp)
-                described: dict[str, Any] = resp.json()
-                return described
+                return _slim_describe(resp.json())
             except (TaskFailed, TimeoutError, httpx2.HTTPError) as exc:
                 return {"error": str(exc)}
 
@@ -318,6 +382,8 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         resp = await client.get(f"/task/{task_id}/{view}")
         check_response(resp)
         result: dict[str, Any] = resp.json()
+        if view == "describe":
+            return _slim_describe(result)
         return _bounded(result, max_bytes)
 
     @mcp.tool(annotations=READ_LOCAL)
@@ -347,7 +413,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         whether `variant` is required (e.g. entity="building" needs a
         variant like "detail"; entity="water" takes none at all).
         """
-        path = resolve_source_path(source_registry, entity, "by_id", variant, id=object_id)
+        path = resolve(entity, "by_id", variant, id=object_id)
         resp = await client.get(path)
         check_response(resp)
         result: dict[str, Any] = resp.json()
@@ -364,7 +430,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         ids. See `list_source_entities` for which entities support batch
         lookup and whether they need `variant`.
         """
-        path = resolve_source_path(source_registry, entity, "batch", variant)
+        path = resolve(entity, "batch", variant)
         resp = await client.post(path, json={"ids": ids})
         check_response(resp)
         result: dict[str, Any] = resp.json()
@@ -372,16 +438,31 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
 
     @mcp.tool(annotations=READ_OPEN)
     async def get_objects_metadata(entity: str, variant: str | None = None) -> dict[str, Any]:
-        """Fetch the field/schema metadata for a /source/{entity} dataset.
+        """Fetch the metadata for a /source/{entity} dataset, plus its attribute names.
 
         Check this before querying an unfamiliar entity, to see its real
-        attribute names instead of guessing what goes in `filter_string`.
-        See `list_source_entities` for which entities need `variant`.
+        attribute names (`attributes`) instead of guessing what goes in
+        `filter_string`. See `list_source_entities` for which entities need
+        `variant`.
         """
-        path = resolve_source_path(source_registry, entity, "metadata", variant)
+        path = resolve(entity, "metadata", variant)
         resp = await client.get(path)
         check_response(resp)
         result: dict[str, Any] = resp.json()
+        # The API has no field list; read it off one feature in the dataset's
+        # own default area. Best effort: metadata without it is still useful.
+        aoi = (result.get("additionalAttributes") or {}).get("default_aoi")
+        if aoi:
+            try:
+                page = await client.get(
+                    resolve(entity, "list", variant), params={"polygon": aoi, "page": 1}
+                )
+                check_response(page)
+                features = page.json().get("features")
+                if features:
+                    result["attributes"] = sorted(features[0]["properties"])
+            except (ValueError, KeyError, httpx2.HTTPError):
+                pass
         return result
 
     @mcp.tool(annotations=READ_OPEN)
@@ -389,7 +470,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         entity: str,
         polygon: str,
         variant: str | None = None,
-        max_pages: int = 10,
+        max_pages: Annotated[int, Field(ge=1)] = 10,
         filter_string: str | None = None,
         geo_type: str | None = None,
         simplify: float | None = None,
@@ -423,7 +504,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
 
         See `list_source_entities` for valid `entity`/`variant` combinations.
         """
-        path = resolve_source_path(source_registry, entity, "list", variant)
+        path = resolve(entity, "list", variant)
         extra_params = _params(
             filter_string=filter_string,
             geo_type=geo_type,
@@ -442,6 +523,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
                 headers={"Prefer": "respond-async"},
             )
             check_response(resp)
+            _check_pages(resp)
             async_result: dict[str, Any] = resp.json()
             return async_result
 
@@ -503,7 +585,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
         so the caller knows whether to fetch more with `page=2`, etc.
         See `list_source_entities` for valid `entity`/`variant` combinations.
         """
-        path = resolve_source_path(source_registry, entity, "list", variant)
+        path = resolve(entity, "list", variant)
         params = _params(
             filter_string=filter_string,
             page=page,
@@ -517,6 +599,8 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
 
         resp = await client.post(path, params=params, json=polygon, headers=headers)
         check_response(resp)
+        if respond_async:
+            _check_pages(resp)
         result: dict[str, Any] = resp.json()
         if "X-Total-Pages" in resp.headers:
             result["total_pages"] = int(resp.headers["X-Total-Pages"])
@@ -525,6 +609,23 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
 
     register_external_tools(mcp, client)
     register_export_tools(mcp, client)
+
+    @mcp.tool(annotations=READ_OPEN)
+    async def usage_summary(
+        start_date: str | None = None, end_date: str | None = None
+    ) -> dict[str, Any]:
+        """This account's usage in a date range (YYYY-MM-DD; default: the current month).
+
+        Requests, objects and area per endpoint and request type, busiest
+        first. Task and record ids in paths are folded to {id}, so there is
+        one row per route, not one per task.
+        """
+        resp = await client.get(
+            "/usage/summary", params=_params(start_date=start_date, end_date=end_date)
+        )
+        check_response(resp)
+        body: dict[str, Any] = resp.json()
+        return {**body, **_fold_usage(body.get("requests", []))}
 
     @mcp.tool(annotations=READ_OPEN)
     async def whoami() -> dict[str, Any]:
@@ -598,6 +699,9 @@ def main(argv: list[str] | None = None) -> None:
     # present; real environment variables (e.g. set by an MCP client's own
     # config) still win, since load_dotenv() never overrides existing ones.
     load_dotenv()
+    # One per-user file shared by every MCP client on the machine, whatever
+    # directory each one launches the server from.
+    load_dotenv(Path.home() / ".signaleyes-mcp.env")
 
     base_url = os.environ.get("SIGNALEYES_BASE_URL", "https://api.neo.nl/v1")
     username = os.environ.get("SIGNALEYES_USERNAME")

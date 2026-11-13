@@ -37,6 +37,7 @@ EXCLUDED_PATTERNS = (
     r"^/source/thirdparty/\{identifier\}/arrow$",
     r"^/analyses/shadow_modelling$",
     r"^/usage/records$",
+    r"^/usage/summary$",  # replaced by the hand-written usage_summary, which folds ids
     r"^/subscriptions$",
     r"^/token/(generate|refresh|revoke)$",
 )
@@ -79,7 +80,6 @@ MCP_NAMES = {
     "get_task_concept_sjoin_concept_sjoin_get": "concept_sjoin",
     "get_task_concept_sjoin_nearest_concept_sjoin_nearest_get": "concept_sjoin_nearest",
     "run_concept_shadow_modelling_concept_shadow_modelling_post": "concept_shadow_modelling",
-    "get_usages_summary_usage_summary_get": "usage_summary",
     "post_geojson_source_geojson_source_geojson_post": "post_geojson",
     "delete_task_task__task_id__delete": "delete_task",
 }
@@ -292,7 +292,13 @@ def write_tool_names(spec: dict[str, Any]) -> frozenset[str]:
 
 
 def resolve_source_path(
-    registry: SourceRegistry, entity: str, shape: str, variant: str | None, **path_kwargs: str
+    registry: SourceRegistry,
+    entity: str,
+    shape: str,
+    variant: str | None,
+    *,
+    variants: SourceVariants | None = None,
+    **path_kwargs: str,
 ) -> str:
     templates = registry.get(entity, {}).get(shape)
     if not templates:
@@ -302,9 +308,10 @@ def resolve_source_path(
     if has_variant not in templates:
         if has_variant:
             raise ValueError(f"{entity!r}'s {shape} endpoint doesn't take a variant.")
+        valid = (variants or {}).get(entity)
         raise ValueError(
             f"{entity!r}'s {shape} endpoint requires a variant sub-type "
-            "(check list_source_entities for the valid values)."
+            + (f"— one of {valid}." if valid else "(check list_source_entities).")
         )
     return templates[has_variant].format(variant=variant, **path_kwargs)
 

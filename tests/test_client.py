@@ -185,7 +185,9 @@ def test_tag_error_round_trips_through_parse_tagged_error():
     assert tagged.endswith("[retryable=yes]")
     assert parse_tagged_error(tagged) == (True, "Rate limited. Wait, then retry.")
     assert parse_tagged_error("no tag here") == (False, None)
-    assert tag_error("'nope' has no list endpoint", read_only=True) == "'nope' has no list endpoint"
+    untagged = tag_error("'nope' has no list endpoint", read_only=True)
+    assert untagged == "'nope' has no list endpoint [retryable=no]"
+    assert parse_tagged_error(untagged) == (False, None)
 
 
 # --- task status / polling ----------------------------------------------------
