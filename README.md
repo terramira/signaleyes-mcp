@@ -145,6 +145,55 @@ schema names it `geojson_list` directly.)
 - `server.py` — the hand-written tools, middlewares, and CLI.
 - `agent.py` — the orchestrator-side client.
 
+## External WFS / PDOK imports
+
+The existing **signaleyes** MCP server now includes:
+
+- `inspect_external_dataset(url, protocol="wfs")`: discover the WFS layers.
+- `import_external_dataset(url, layer, polygon, protocol="wfs")`: download
+  a bounded GeoJSON snapshot, clip it to a WGS84 WKT polygon, and upload it
+  through `/source/geojson` using this server's existing authenticated client.
+
+These tools use the existing SignalEyes authentication. Example workflow:
+
+> Use the PDOK/OGC discovery MCP to find the BAG WFS link. In signaleyes,
+> inspect_external_dataset, then import_external_dataset for the pand layer
+> within POLYGON((4.8928 52.3720,4.8935 52.3720,4.8935 52.37245,4.8928 52.37245,4.8928 52.3720)).
+> Poll manage_task with view="status" until done, then get view="describe".
+
+The secure downloader is included in this package. WFS 2.0 must advertise
+GeoJSON output and CRS84 or EPSG:4326. Request bounds follow the advertised
+CRS axis order; returned GeoJSON must use longitude-first CRS84 coordinates.
+GML-only services are unsupported. Limits: 5,000 features, 20 pages, 10 MiB
+and 60 seconds of download time; private addresses and redirects are blocked.
+No credentials are sent to PDOK. Empty selections create no task; incomplete
+downloads are not uploaded. An upload timeout may still have created a task:
+check before retrying.
+
+Existing `fetch_all_pages` / `post_large_polygon`, `manage_task`, `wait_for_task`
+and `concept_*` tools fetch data, manage tasks and run spatial analysis.
+For counts and summaries, prefer `manage_task(view="describe")`; `wait_for_task`
+downloads the task result into the conversation. This imports a snapshot,
+not a live link that automatically refreshes.
+
+## Export a task as GeoJSON
+
+`export_task_file(task_id)` downloads a completed task through the existing
+authenticated SignalEyes client and saves its original GeoJSON to
+`SIGNALEYES_OUTPUT_DIR` (default `~/signaleyes_outputs`). The MCP response
+contains only the path, filename, byte size and feature count, so a result
+larger than the chat tool limit never enters the model's conversation.
+Exports are bounded to 50 MB and 120 seconds; failed exports remove partial
+files. Existing tasks are unchanged and no centroid task is needed.
+
+Export a completed task with
+`export_task_file(task_id="YOUR_COMPLETED_TASK_ID")`. The tool returns the
+saved file path without rerunning the analysis or returning inline GeoJSON.
+
+Open the resulting `.geojson` file in your preferred GIS application.
+The file stays on your computer; the tool returns a local path, not a
+public download link or an uploaded attachment. Credentials remain local.
+
 ## Setup
 
 Requires [uv](https://docs.astral.sh/uv/).

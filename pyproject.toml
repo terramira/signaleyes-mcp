@@ -10,6 +10,7 @@ dependencies = [
     "fastmcp>=3.4.7",
     "httpx>=0.28.1",
     "python-dotenv>=1.2.2",
+    "shapely>=2.0",
 ]
 
 [project.scripts]
@@ -54,4 +55,9 @@ warn_unused_ignores = true
 # fastmcp's OpenAPI provider isn't publicly typed; everything else is stdlib/httpx.
 [[tool.mypy.overrides]]
 module = "fastmcp.server.providers.openapi"
+ignore_missing_imports = true
+
+# Shapely does not ship complete type information.
+[[tool.mypy.overrides]]
+module = "shapely.*"
 ignore_missing_imports = true
