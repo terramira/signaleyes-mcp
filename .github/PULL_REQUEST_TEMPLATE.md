@@ -6,4 +6,4 @@
 - [ ] `uv run mypy src/` passes
 - [ ] If this touches auth, pagination, or task polling: ran `uv run pytest -m network` against a real environment, or explain why not
 
-**Version bump needed?** (new tool/behavior change → yes, per README's release section)
+**Version bump needed?** (new tool/behavior change → yes, per the release section in docs/design.md)
