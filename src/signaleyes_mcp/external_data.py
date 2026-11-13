@@ -468,8 +468,15 @@ def download_source(
                     "_external_imported_at": imported_at,
                 }
             )
+            # /source/geojson rejects features without a string id; not every source sends one.
+            feature_id = feature.get("id")
             features.append(
-                {"type": "Feature", "geometry": mapping(clipped), "properties": properties}
+                {
+                    "type": "Feature",
+                    "id": str(feature_id) if feature_id not in (None, "") else fingerprint,
+                    "geometry": mapping(clipped),
+                    "properties": properties,
+                }
             )
         matched = _count(data.get("numberMatched"))
         if matched is not None:
