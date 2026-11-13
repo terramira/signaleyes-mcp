@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import pytest
 from fastmcp.exceptions import ToolError
 
@@ -42,7 +42,7 @@ def test_import_uploads_geojson_once_with_existing_client(
 ):
     calls = fake_core(monkeypatch)
     async_client_post_queue.responses.append(
-        httpx.Response(202, json={"id": "import-123", "status": "queued"})
+        httpx2.Response(202, json={"id": "import-123", "status": "queued"})
     )
     result = call(server, "import_external_dataset", url=URL, layer="bag:pand", polygon=AOI)
     assert calls == [(URL, "bag:pand", AOI, "auto")]
@@ -85,14 +85,14 @@ def test_upload_failure_is_not_reported_as_a_task(
     server, monkeypatch, async_client_post_queue, status
 ):
     fake_core(monkeypatch)
-    async_client_post_queue.responses.append(httpx.Response(status))
+    async_client_post_queue.responses.append(httpx2.Response(status))
     with pytest.raises(ToolError, match=f"HTTP {status}"):
         call(server, "import_external_dataset", url=URL, layer="bag:pand", polygon=AOI)
 
 
 def test_missing_task_id_does_not_reupload(server, monkeypatch, async_client_post_queue):
     fake_core(monkeypatch)
-    async_client_post_queue.responses.append(httpx.Response(202, json={"status": "queued"}))
+    async_client_post_queue.responses.append(httpx2.Response(202, json={"status": "queued"}))
     with pytest.raises(ToolError, match="check tasks before retrying"):
         call(server, "import_external_dataset", url=URL, layer="bag:pand", polygon=AOI)
     assert len(async_client_post_queue.calls) == 1
@@ -100,7 +100,7 @@ def test_missing_task_id_does_not_reupload(server, monkeypatch, async_client_pos
 
 def test_external_tools_have_correct_side_effect_annotations(server):
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
-    assert tools["inspect_external_dataset"].annotations.readOnlyHint is True
-    assert tools["import_external_dataset"].annotations.readOnlyHint is False
-    assert tools["import_external_dataset"].annotations.idempotentHint is False
-    assert tools["export_task_file"].annotations.readOnlyHint is False
+    assert tools["inspect_external_dataset"].annotations.read_only_hint is True
+    assert tools["import_external_dataset"].annotations.read_only_hint is False
+    assert tools["import_external_dataset"].annotations.idempotent_hint is False
+    assert tools["export_task_file"].annotations.read_only_hint is False

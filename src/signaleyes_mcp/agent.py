@@ -92,7 +92,7 @@ async def list_tools(client: Client[Any], *, read_only: bool | None = None) -> l
     tools = await client.list_tools()
     if read_only is None:
         return tools
-    return [t for t in tools if bool(t.annotations and t.annotations.readOnlyHint) is read_only]
+    return [t for t in tools if bool(t.annotations and t.annotations.read_only_hint) is read_only]
 
 
 async def bind(client: Client[Any], *, read_only: bool | None = None) -> tuple[str, list[Any]]:

@@ -4,7 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
-import httpx
+import httpx2
 import pytest
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -30,12 +30,12 @@ def export(tmp_path, monkeypatch, *, state="done", payload=GEOJSON, limit=None, 
     def handler(request):
         calls.append(request.url.path)
         if request.url.path.endswith("/result"):
-            return httpx.Response(200, json=payload)
-        return httpx.Response(200, json={"status": state})
+            return httpx2.Response(200, json=payload)
+        return httpx2.Response(200, json={"status": state})
 
     async def run():
-        async with httpx.AsyncClient(
-            base_url="https://example.test", transport=httpx.MockTransport(handler)
+        async with httpx2.AsyncClient(
+            base_url="https://example.test", transport=httpx2.MockTransport(handler)
         ) as client:
             server = FastMCP("export")
             exports.register_export_tools(server, client)

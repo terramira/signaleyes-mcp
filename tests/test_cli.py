@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import asyncio
 
-import httpx
+import httpx2
 import pytest
 
 from signaleyes_mcp.server import SMOKE_ENTITIES, _build_arg_parser, run_smoke
 
 
-def _response(status_code=200, json=None, headers=None) -> httpx.Response:
-    return httpx.Response(
+def _response(status_code=200, json=None, headers=None) -> httpx2.Response:
+    return httpx2.Response(
         status_code,
         json=json,
         headers=headers or {},
-        request=httpx.Request("GET", "https://example.test/"),
+        request=httpx2.Request("GET", "https://example.test/"),
     )
 
 

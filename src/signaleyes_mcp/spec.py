@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-import httpx
+import httpx2
 from fastmcp.server.providers.openapi import MCPType, OpenAPITool, RouteMap
 from fastmcp.utilities.openapi import HTTPRoute
 from mcp.types import ToolAnnotations
@@ -90,16 +90,16 @@ SourceRegistry = dict[str, dict[str, dict[bool, str]]]
 SourceVariants = dict[str, list[str]]
 
 READ_OPEN = ToolAnnotations(
-    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True
 )
 READ_LOCAL = ToolAnnotations(
-    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+    read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False
 )
 WRITE_OPEN = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True
 )
 DESTRUCTIVE_OPEN = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True
+    read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True
 )
 
 
@@ -134,9 +134,9 @@ def load_spec(base_url: str, max_age: float = 86_400) -> dict[str, Any]:
         if cached is not None:
             return cached
     try:
-        resp = httpx.get(f"{base_url}/openapi.json", timeout=30)
+        resp = httpx2.get(f"{base_url}/openapi.json", timeout=30)
         resp.raise_for_status()
-    except (httpx.HTTPError, OSError):
+    except (httpx2.HTTPError, OSError):
         stale = _read_cache(cache) if cache else None
         if stale is not None:
             return stale

@@ -6,7 +6,7 @@ import asyncio
 from types import ModuleType
 from typing import Any, Literal
 
-import httpx
+import httpx2
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
@@ -19,7 +19,7 @@ def _load_core() -> ModuleType:
     return external_data
 
 
-def register_external_tools(mcp: FastMCP, client: httpx.AsyncClient) -> None:
+def register_external_tools(mcp: FastMCP, client: httpx2.AsyncClient) -> None:
     readers = asyncio.Semaphore(2)
 
     async def read(function: Any, *args: Any) -> dict[str, Any]:
@@ -86,7 +86,7 @@ def register_external_tools(mcp: FastMCP, client: httpx.AsyncClient) -> None:
                 headers={"Prefer": "respond-async"},
                 follow_redirects=False,
             )
-        except httpx.HTTPError as exc:
+        except httpx2.HTTPError as exc:
             raise ToolError(
                 "Upload connection failed. It may have been accepted; check tasks before retrying."
             ) from exc

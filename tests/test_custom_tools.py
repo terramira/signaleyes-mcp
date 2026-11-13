@@ -3,19 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 
-import httpx
+import httpx2
 import pytest
 from fastmcp.exceptions import ToolError
 
 from signaleyes_mcp import build_server
 
 
-def _response(status_code: int = 200, json=None, headers=None) -> httpx.Response:
-    return httpx.Response(
+def _response(status_code: int = 200, json=None, headers=None) -> httpx2.Response:
+    return httpx2.Response(
         status_code,
         json=json,
         headers=headers or {},
-        request=httpx.Request("GET", "https://example.test/"),
+        request=httpx2.Request("GET", "https://example.test/"),
     )
 
 
@@ -88,7 +88,7 @@ def test_wait_for_task_reports_a_failed_task_and_does_not_delete_it(
         deleted.append(url)
         return _response(status_code=204)
 
-    monkeypatch.setattr(httpx.AsyncClient, "delete", fake_delete)
+    monkeypatch.setattr(httpx2.AsyncClient, "delete", fake_delete)
     server = _server(mock_spec_get, spy_async_client)
     async_client_get_queue.responses.append(
         _response(json={"id": "t1", "status": "failed", "error": "out of memory"})
@@ -109,7 +109,7 @@ def test_wait_for_task_treats_500_with_failed_body_as_failed_not_transient(
         deleted.append(url)
         return _response(status_code=200, json={"id": "t1", "deleted": True})
 
-    monkeypatch.setattr(httpx.AsyncClient, "delete", fake_delete)
+    monkeypatch.setattr(httpx2.AsyncClient, "delete", fake_delete)
     server = _server(mock_spec_get, spy_async_client)
     async_client_get_queue.responses.append(
         _response(status_code=500, json={"id": "t1", "status": "failed", "error": "ISE"})
@@ -142,7 +142,7 @@ def test_wait_for_task_retries_past_a_transient_timeout(
     server = _server(mock_spec_get, spy_async_client)
     async_client_get_queue.responses.extend(
         [
-            httpx.TimeoutException("timed out"),
+            httpx2.TimeoutException("timed out"),
             _response(json={"id": "t1", "status": "done", "error": None}),
             _response(json={"type": "FeatureCollection", "features": [{"id": 1}]}),
         ]
@@ -161,7 +161,7 @@ def test_wait_for_task_retries_a_timeout_on_the_result_fetch_too(
     async_client_get_queue.responses.extend(
         [
             _response(json={"id": "t1", "status": "done", "error": None}),
-            httpx.TimeoutException("timed out"),
+            httpx2.TimeoutException("timed out"),
             _response(json={"id": "t1", "status": "done", "error": None}),
             _response(json={"type": "FeatureCollection", "features": [{"id": 1}]}),
         ]
@@ -526,8 +526,8 @@ def test_wait_for_tasks_describes_each_and_isolates_failures(
     async def fake_delete(self, url, **kwargs):
         return _response(status_code=200)
 
-    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
-    monkeypatch.setattr(httpx.AsyncClient, "delete", fake_delete)
+    monkeypatch.setattr(httpx2.AsyncClient, "get", fake_get)
+    monkeypatch.setattr(httpx2.AsyncClient, "delete", fake_delete)
     server = _server(mock_spec_get, spy_async_client)
 
     out = _call(server, "wait_for_tasks", {"task_ids": ["a", "b"]}).structured_content

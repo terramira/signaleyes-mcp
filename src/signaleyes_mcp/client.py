@@ -13,7 +13,7 @@ import random
 import re
 from typing import Any
 
-import httpx
+import httpx2
 
 # 500 is deliberately absent: the API answers GET /task/{id} for a *failed*
 # task with HTTP 500 and {"status": "failed"} in the body, and retrying that
@@ -28,7 +28,7 @@ _STATUS_RE = re.compile(r"(?:'|HTTP error )([45]\d{2})(?:\s|:)")
 _OUTCOME_RE = re.compile(r" — (?P<hint>[^—]*) \[retryable=(?P<retryable>yes|no)\]$")
 
 
-def creates_task(request: httpx.Request) -> bool:
+def creates_task(request: httpx2.Request) -> bool:
     """A request that may enqueue a server-side task must never be re-sent on 5xx."""
     if request.method != "GET":
         return True
@@ -42,8 +42,8 @@ def retry_delay(attempt: int, backoff: float = 0.4) -> float:
     return float(backoff * (2**attempt) * (0.5 + random.random()))
 
 
-class RetryingClient(httpx.AsyncClient):
-    """httpx.AsyncClient that re-sends on connect errors, 429, and gateway 5xx.
+class RetryingClient(httpx2.AsyncClient):
+    """httpx2.AsyncClient that re-sends on connect errors, 429, and gateway 5xx.
 
     Retries live in `send()` rather than a custom transport so httpx keeps
     its default transport — and with it HTTP(S)_PROXY / NO_PROXY support,
@@ -52,11 +52,11 @@ class RetryingClient(httpx.AsyncClient):
 
     retries = 3
 
-    async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+    async def send(self, request: httpx2.Request, **kwargs: Any) -> httpx2.Response:
         for attempt in range(self.retries + 1):
             try:
                 response = await super().send(request, **kwargs)
-            except httpx.ConnectError:
+            except httpx2.ConnectError:
                 if attempt == self.retries or creates_task(request):
                     raise
                 await asyncio.sleep(retry_delay(attempt))
@@ -70,14 +70,14 @@ class RetryingClient(httpx.AsyncClient):
         raise AssertionError("unreachable")
 
 
-def make_client(base_url: str, username: str, password: str) -> httpx.AsyncClient:
+def make_client(base_url: str, username: str, password: str) -> httpx2.AsyncClient:
     # httpx's default 5s timeout is too tight for this API: task-status
     # polls, /result and /describe on large datasets have all been observed
     # taking longer under normal conditions. 10s to connect, 60s to read.
     return RetryingClient(
         base_url=base_url,
-        auth=httpx.BasicAuth(username, password),
-        timeout=httpx.Timeout(10.0, read=60.0),
+        auth=httpx2.BasicAuth(username, password),
+        timeout=httpx2.Timeout(10.0, read=60.0),
     )
 
 
@@ -133,7 +133,7 @@ def parse_tagged_error(message: str) -> tuple[bool, str | None]:
     return match.group("retryable") == "yes", match.group("hint")
 
 
-def json_body(resp: httpx.Response) -> dict[str, Any]:
+def json_body(resp: httpx2.Response) -> dict[str, Any]:
     try:
         body = resp.json()
     except ValueError:
@@ -141,7 +141,7 @@ def json_body(resp: httpx.Response) -> dict[str, Any]:
     return body if isinstance(body, dict) else {}
 
 
-def check_response(resp: httpx.Response) -> None:
+def check_response(resp: httpx2.Response) -> None:
     """Like resp.raise_for_status(), but folds the API's JSON `detail` into the error.
 
     The API returns structured 4xx/5xx bodies (e.g. 422 validation errors)
@@ -149,11 +149,11 @@ def check_response(resp: httpx.Response) -> None:
     """
     try:
         resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
+    except httpx2.HTTPStatusError as exc:
         detail = json_body(resp).get("detail")
         if not detail:
             raise
-        raise httpx.HTTPStatusError(
+        raise httpx2.HTTPStatusError(
             f"{exc} — {detail}", request=exc.request, response=exc.response
         ) from exc
 
@@ -162,7 +162,7 @@ class TaskFailed(RuntimeError):
     pass
 
 
-async def task_status(client: httpx.AsyncClient, task_id: str) -> dict[str, Any]:
+async def task_status(client: httpx2.AsyncClient, task_id: str) -> dict[str, Any]:
     """GET /task/{id} as the API means it, not as its status code says.
 
     A failed task comes back as HTTP 500 with {"status": "failed", ...} in the
@@ -176,7 +176,7 @@ async def task_status(client: httpx.AsyncClient, task_id: str) -> dict[str, Any]
 
 
 async def poll_until_done(
-    client: httpx.AsyncClient,
+    client: httpx2.AsyncClient,
     task_id: str,
     max_wait: float,
     poll_interval: float = 2.0,
@@ -209,7 +209,7 @@ async def poll_until_done(
                             f"Task {task_id} failed: {body.get('error')}. "
                             f"delete_task('{task_id}') to clean it up."
                         )
-                except (httpx.TimeoutException, httpx.NetworkError):
+                except (httpx2.TimeoutException, httpx2.NetworkError):
                     pass
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, poll_interval)
