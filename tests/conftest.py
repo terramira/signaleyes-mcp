@@ -4,14 +4,14 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import pytest
 from spec_helpers import make_spec, op
 
 
 @pytest.fixture(autouse=True)
 def no_spec_cache(monkeypatch):
-    """Tests mock httpx.get; an on-disk spec cache would bypass that mock."""
+    """Tests mock httpx2.get; an on-disk spec cache would bypass that mock."""
     monkeypatch.setenv("SIGNALEYES_SPEC_CACHE", "")
 
 
@@ -101,23 +101,23 @@ def fake_spec() -> dict:
 
 @pytest.fixture
 def mock_spec_get(monkeypatch, fake_spec):
-    """Patch httpx.get so build_server() never hits the network. Returns a call recorder."""
+    """Patch httpx2.get so build_server() never hits the network. Returns a call recorder."""
     calls = []
 
     def fake_get(url, timeout=None):
         calls.append(url)
-        request = httpx.Request("GET", url)
-        return httpx.Response(200, json=fake_spec, request=request)
+        request = httpx2.Request("GET", url)
+        return httpx2.Response(200, json=fake_spec, request=request)
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx2, "get", fake_get)
     return calls
 
 
 @pytest.fixture
 def spy_async_client(monkeypatch):
-    """Patch httpx.AsyncClient to record constructor kwargs while staying a real client."""
+    """Patch httpx2.AsyncClient to record constructor kwargs while staying a real client."""
     captured = {}
-    real_init = httpx.AsyncClient.__init__
+    real_init = httpx2.AsyncClient.__init__
 
     def spying_init(self, *args, **kwargs):
         captured["base_url"] = kwargs.get("base_url")
@@ -126,15 +126,15 @@ def spy_async_client(monkeypatch):
         captured["transport"] = kwargs.get("transport")
         real_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(httpx.AsyncClient, "__init__", spying_init)
+    monkeypatch.setattr(httpx2.AsyncClient, "__init__", spying_init)
     return captured
 
 
 @pytest.fixture
 def async_client_get_queue(monkeypatch):
-    """Patch httpx.AsyncClient.get to pop pre-queued responses in call order.
+    """Patch httpx2.AsyncClient.get to pop pre-queued responses in call order.
 
-    Tests append httpx.Response objects to `.responses` before invoking the
+    Tests append httpx2.Response objects to `.responses` before invoking the
     tool under test; `.calls` records each (url, params) pair made. An
     Exception instance in the queue is raised instead of returned — used to
     simulate a transient httpx timeout on one poll without ending the test.
@@ -148,7 +148,7 @@ def async_client_get_queue(monkeypatch):
             raise next_item
         return next_item
 
-    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    monkeypatch.setattr(httpx2.AsyncClient, "get", fake_get)
     return state
 
 
@@ -161,7 +161,7 @@ def async_client_post_queue(monkeypatch):
         state.calls.append({"url": url, "params": params, "json": json, "headers": headers})
         return state.responses.pop(0)
 
-    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    monkeypatch.setattr(httpx2.AsyncClient, "post", fake_post)
     return state
 
 

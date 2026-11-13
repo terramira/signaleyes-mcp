@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import httpx
+import httpx2
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
@@ -25,7 +25,7 @@ def output_dir() -> Path:
     return path
 
 
-def register_export_tools(mcp: FastMCP, client: httpx.AsyncClient) -> None:
+def register_export_tools(mcp: FastMCP, client: httpx2.AsyncClient) -> None:
     @mcp.tool(annotations=WRITE_OPEN)
     async def export_task_file(task_id: str) -> dict[str, Any]:
         """Save a completed SignalEyes task as a local GeoJSON file, not inline data.
@@ -89,7 +89,7 @@ def register_export_tools(mcp: FastMCP, client: httpx.AsyncClient) -> None:
                 }
                 complete = True
                 return result
-        except httpx.HTTPError as exc:
+        except httpx2.HTTPError as exc:
             raise ToolError("Task download failed; the existing task is unchanged.") from exc
         except TimeoutError as exc:
             raise ToolError("Export timed out; the existing task is unchanged.") from exc

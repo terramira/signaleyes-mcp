@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any, Literal
 
-import httpx
+import httpx2
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -170,7 +170,7 @@ class _AwaitInputTasks(Middleware):
     """
 
     def __init__(
-        self, client: httpx.AsyncClient, tools: frozenset[str], max_wait: float = 120.0
+        self, client: httpx2.AsyncClient, tools: frozenset[str], max_wait: float = 120.0
     ) -> None:
         self._client = client
         self._tools = tools
@@ -188,7 +188,7 @@ class _AwaitInputTasks(Middleware):
             async def wait(key: str, task_id: str) -> None:
                 try:
                     await poll_until_done(self._client, task_id, self._max_wait)
-                except (TaskFailed, TimeoutError, httpx.HTTPError) as exc:
+                except (TaskFailed, TimeoutError, httpx2.HTTPError) as exc:
                     raise ToolError(f"{key}={task_id}: {exc}") from exc
 
             await asyncio.gather(*(wait(k, t) for k, t in inputs))
@@ -288,7 +288,7 @@ def build_server(base_url: str, username: str, password: str) -> FastMCP:
                 check_response(resp)
                 described: dict[str, Any] = resp.json()
                 return described
-            except (TaskFailed, TimeoutError, httpx.HTTPError) as exc:
+            except (TaskFailed, TimeoutError, httpx2.HTTPError) as exc:
                 return {"error": str(exc)}
 
         results = await asyncio.gather(*(one(t) for t in task_ids))

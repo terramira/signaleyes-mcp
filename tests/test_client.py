@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-import httpx
+import httpx2
 import pytest
 
 from signaleyes_mcp.client import (
@@ -19,28 +19,28 @@ from signaleyes_mcp.client import (
 )
 
 
-def _response(status_code=200, json=None, headers=None) -> httpx.Response:
-    return httpx.Response(
+def _response(status_code=200, json=None, headers=None) -> httpx2.Response:
+    return httpx2.Response(
         status_code,
         json=json,
         headers=headers or {},
-        request=httpx.Request("GET", "https://example.test/"),
+        request=httpx2.Request("GET", "https://example.test/"),
     )
 
 
 # --- retrying client ----------------------------------------------------------
 
 
-def _client(statuses: list[int], body=None) -> tuple[RetryingClient, list[httpx.Request]]:
-    seen: list[httpx.Request] = []
+def _client(statuses: list[int], body=None) -> tuple[RetryingClient, list[httpx2.Request]]:
+    seen: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen.append(request)
         status = statuses[min(len(seen), len(statuses)) - 1]
-        return httpx.Response(status, json=body or {"status": "x"})
+        return httpx2.Response(status, json=body or {"status": "x"})
 
     client = RetryingClient(
-        base_url="https://example.test/v1", transport=httpx.MockTransport(handler)
+        base_url="https://example.test/v1", transport=httpx2.MockTransport(handler)
     )
     return client, seen
 
@@ -95,27 +95,27 @@ def test_429_is_retried_even_for_task_creating_requests():
 def test_connect_error_is_retried_for_safe_requests_only():
     calls = {"n": 0}
 
-    def flaky(request: httpx.Request) -> httpx.Response:
+    def flaky(request: httpx2.Request) -> httpx2.Response:
         calls["n"] += 1
         if calls["n"] == 1:
-            raise httpx.ConnectError("down", request=request)
-        return httpx.Response(200, json={})
+            raise httpx2.ConnectError("down", request=request)
+        return httpx2.Response(200, json={})
 
-    client = RetryingClient(base_url="https://example.test", transport=httpx.MockTransport(flaky))
+    client = RetryingClient(base_url="https://example.test", transport=httpx2.MockTransport(flaky))
     assert asyncio.run(client.get("/task/x")).status_code == 200
     calls["n"] = 0
-    with pytest.raises(httpx.ConnectError):
+    with pytest.raises(httpx2.ConnectError):
         asyncio.run(client.post("/source/geojson", json={}))
 
 
 def test_creates_task_rules():
-    assert not creates_task(httpx.Request("GET", "https://x/v1/task/abc"))
-    assert creates_task(httpx.Request("GET", "https://x/v1/concept/overlay"))
-    assert creates_task(httpx.Request("GET", "https://x/v1/analyses/baf"))
+    assert not creates_task(httpx2.Request("GET", "https://x/v1/task/abc"))
+    assert creates_task(httpx2.Request("GET", "https://x/v1/concept/overlay"))
+    assert creates_task(httpx2.Request("GET", "https://x/v1/analyses/baf"))
     assert creates_task(
-        httpx.Request("GET", "https://x/v1/source/tree", headers={"Prefer": "respond-async"})
+        httpx2.Request("GET", "https://x/v1/source/tree", headers={"Prefer": "respond-async"})
     )
-    assert creates_task(httpx.Request("POST", "https://x/v1/source/tree"))
+    assert creates_task(httpx2.Request("POST", "https://x/v1/source/tree"))
 
 
 def test_retry_delay_stays_within_jitter_band():
@@ -133,16 +133,16 @@ def test_check_response_passes_through_on_success():
 
 
 def test_check_response_folds_detail_into_the_error():
-    with pytest.raises(httpx.HTTPStatusError, match="polygon must be in EPSG:4326"):
+    with pytest.raises(httpx2.HTTPStatusError, match="polygon must be in EPSG:4326"):
         check_response(_response(422, json={"detail": "polygon must be in EPSG:4326"}))
 
 
 def test_check_response_tolerates_non_object_and_non_json_bodies():
     for resp in (
-        httpx.Response(502, json="Bad Gateway", request=httpx.Request("GET", "https://x")),
-        httpx.Response(500, text="oops", request=httpx.Request("GET", "https://x")),
+        httpx2.Response(502, json="Bad Gateway", request=httpx2.Request("GET", "https://x")),
+        httpx2.Response(500, text="oops", request=httpx2.Request("GET", "https://x")),
     ):
-        with pytest.raises(httpx.HTTPStatusError, match=str(resp.status_code)):
+        with pytest.raises(httpx2.HTTPStatusError, match=str(resp.status_code)):
             check_response(resp)
 
 
@@ -192,30 +192,30 @@ def test_tag_error_round_trips_through_parse_tagged_error():
 
 
 def test_task_status_reads_failed_body_behind_a_500():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"id": "t", "status": "failed", "error": "boom"})
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(500, json={"id": "t", "status": "failed", "error": "boom"})
 
-    client = httpx.AsyncClient(base_url="https://x", transport=httpx.MockTransport(handler))
+    client = httpx2.AsyncClient(base_url="https://x", transport=httpx2.MockTransport(handler))
     assert asyncio.run(task_status(client, "t"))["status"] == "failed"
 
 
 def test_task_status_raises_for_a_500_without_a_status():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"detail": "Internal server error"})
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(500, json={"detail": "Internal server error"})
 
-    client = httpx.AsyncClient(base_url="https://x", transport=httpx.MockTransport(handler))
-    with pytest.raises(httpx.HTTPStatusError, match="Internal server error"):
+    client = httpx2.AsyncClient(base_url="https://x", transport=httpx2.MockTransport(handler))
+    with pytest.raises(httpx2.HTTPStatusError, match="Internal server error"):
         asyncio.run(task_status(client, "t"))
 
 
 def test_poll_until_done_reports_failure_without_deleting():
     seen: list[str] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen.append(request.method)
-        return httpx.Response(500, json={"id": "t", "status": "failed", "error": "boom"})
+        return httpx2.Response(500, json={"id": "t", "status": "failed", "error": "boom"})
 
-    client = httpx.AsyncClient(base_url="https://x", transport=httpx.MockTransport(handler))
+    client = httpx2.AsyncClient(base_url="https://x", transport=httpx2.MockTransport(handler))
     with pytest.raises(RuntimeError, match="boom.*delete_task"):
         asyncio.run(poll_until_done(client, "t", max_wait=5))
     assert seen == ["GET"]

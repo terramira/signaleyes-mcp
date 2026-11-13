@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-import httpx
+import httpx2
 import pytest
 from spec_helpers import make_spec, op
 
@@ -10,11 +10,11 @@ from signaleyes_mcp import build_server
 from signaleyes_mcp.spec import MCP_NAMES
 
 
-def _task_response(task_id: str, status: str, error: str | None = None) -> httpx.Response:
-    return httpx.Response(
+def _task_response(task_id: str, status: str, error: str | None = None) -> httpx2.Response:
+    return httpx2.Response(
         200,
         json={"id": task_id, "status": status, "error": error},
-        request=httpx.Request("GET", "https://example.test/"),
+        request=httpx2.Request("GET", "https://example.test/"),
     )
 
 
@@ -100,9 +100,9 @@ def test_stale_spec_cache_used_when_fetch_fails(monkeypatch, tmp_path, fake_spec
     monkeypatch.setenv("SIGNALEYES_SPEC_CACHE", str(cache))
 
     def fake_get(url, timeout=None):
-        raise httpx.ConnectError("down")
+        raise httpx2.ConnectError("down")
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx2, "get", fake_get)
 
     server = build_server("https://example.test/v1", "user", "pass")
     assert "fetch_all_pages" in _tool_names(server)
@@ -131,7 +131,7 @@ def test_concept_call_waits_for_queued_input_tasks(
         task = url.rsplit("/", 1)[1]
         return _task_response(task, next(state[task]))
 
-    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    monkeypatch.setattr(httpx2.AsyncClient, "get", fake_get)
     forwarded = []
 
     async def call_next(ctx):
@@ -304,9 +304,9 @@ def test_client_uses_given_base_url(mock_spec_get, spy_async_client):
 def test_client_uses_basic_auth_with_given_credentials(mock_spec_get, spy_async_client):
     build_server("https://example.test/v1", "alice", "s3cret")
     auth = spy_async_client["auth"]
-    assert isinstance(auth, httpx.BasicAuth)
-    # httpx.BasicAuth stores credentials pre-encoded; round-trip via the auth header it builds.
-    request = httpx.Request("GET", "https://example.test/v1/")
+    assert isinstance(auth, httpx2.BasicAuth)
+    # httpx2.BasicAuth stores credentials pre-encoded; round-trip via the auth header it builds.
+    request = httpx2.Request("GET", "https://example.test/v1/")
     flow = auth.sync_auth_flow(request)
     signed_request = next(flow)
     assert signed_request.headers["Authorization"].startswith("Basic ")
@@ -318,7 +318,7 @@ def test_client_uses_a_longer_than_default_timeout(mock_spec_get, spy_async_clie
     a hard failure to every tool sharing this client."""
     build_server("https://example.test/v1", "user", "pass")
     timeout = spy_async_client["timeout"]
-    assert isinstance(timeout, httpx.Timeout)
+    assert isinstance(timeout, httpx2.Timeout)
     assert timeout.connect == 10.0
     assert timeout.read == 60.0
 
@@ -337,10 +337,10 @@ def test_mcp_names_shortens_every_mapped_operation(monkeypatch, spy_async_client
     )
 
     def fake_get(url, timeout=None):
-        request = httpx.Request("GET", url)
-        return httpx.Response(200, json=spec, request=request)
+        request = httpx2.Request("GET", url)
+        return httpx2.Response(200, json=spec, request=request)
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx2, "get", fake_get)
 
     server = build_server("https://example.test/v1", "user", "pass")
     names = set(_tool_names(server))
@@ -367,12 +367,12 @@ def test_server_has_workflow_instructions(mock_spec_get, spy_async_client):
 
 def test_spec_fetch_http_error_propagates(monkeypatch):
     def fake_get(url, timeout=None):
-        request = httpx.Request("GET", url)
-        return httpx.Response(500, json={"detail": "boom"}, request=request)
+        request = httpx2.Request("GET", url)
+        return httpx2.Response(500, json={"detail": "boom"}, request=request)
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx2, "get", fake_get)
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(httpx2.HTTPStatusError):
         build_server("https://example.test/v1", "user", "pass")
 
 
@@ -398,12 +398,12 @@ def test_tools_carry_read_vs_destructive_annotations(mock_spec_get, spy_async_cl
     tools = {t.name: t for t in asyncio.run(server.list_tools())}
 
     assert tools["list_source_entities"].annotations is not None
-    assert tools["list_source_entities"].annotations.readOnlyHint is True
-    assert tools["list_source_entities"].annotations.openWorldHint is False
-    assert tools["fetch_all_pages"].annotations.readOnlyHint is True
-    assert tools["post_large_polygon"].annotations.readOnlyHint is False
+    assert tools["list_source_entities"].annotations.read_only_hint is True
+    assert tools["list_source_entities"].annotations.open_world_hint is False
+    assert tools["fetch_all_pages"].annotations.read_only_hint is True
+    assert tools["post_large_polygon"].annotations.read_only_hint is False
     assert tools["delete_task"].annotations is not None
-    assert tools["delete_task"].annotations.destructiveHint is True
+    assert tools["delete_task"].annotations.destructive_hint is True
 
 
 def test_concept_middleware_ignores_tools_without_task_inputs(mock_spec_get, spy_async_client):
@@ -427,10 +427,10 @@ def test_generated_tool_errors_are_tagged(mock_spec_get, spy_async_client, async
     """The tag middleware wraps every tool, so the orchestrator never parses error prose."""
     server = build_server("https://example.test/v1", "user", "pass")
     async_client_get_queue.responses.append(
-        httpx.Response(
+        httpx2.Response(
             409,
             json={"detail": "Task x is not done yet"},
-            request=httpx.Request("GET", "https://example.test/"),
+            request=httpx2.Request("GET", "https://example.test/"),
         )
     )
     with pytest.raises(Exception, match=r"wait_for_task\. \[retryable=yes\]$"):
@@ -451,9 +451,9 @@ def test_spec_cache_is_keyed_by_base_url_and_survives_corruption(monkeypatch, tm
 
     def fake_get(url, timeout=None):
         calls.append(url)
-        return httpx.Response(200, json=fake_spec, request=httpx.Request("GET", url))
+        return httpx2.Response(200, json=fake_spec, request=httpx2.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx2, "get", fake_get)
     load_spec("https://a.test/v1")
     assert json.loads(a.read_text()) == fake_spec
     a.write_text("{truncated")
