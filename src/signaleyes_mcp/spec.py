@@ -114,7 +114,7 @@ def _cache_path(base_url: str) -> Path | None:
 
 def _read_cache(cache: Path) -> dict[str, Any] | None:
     try:
-        spec: dict[str, Any] = json.loads(cache.read_text())
+        spec: dict[str, Any] = json.loads(cache.read_text(encoding="utf-8"))
         return spec
     except (OSError, ValueError):
         return None
@@ -145,7 +145,7 @@ def load_spec(base_url: str, max_age: float = 86_400) -> dict[str, Any]:
     if cache:
         cache.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=cache.parent, suffix=".tmp")
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(resp.text)
         os.replace(tmp, cache)
     return spec
