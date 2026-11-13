@@ -321,6 +321,22 @@ def _count(value: Any) -> int | None:
     return None
 
 
+def _wfs_hits(reader: PublicReader, base: str, layer: str, bbox: str) -> int | None:
+    """Total features matching the query, or None when the service won't say ("unknown")."""
+    body, _ = reader.get(
+        _query(
+            base,
+            service="WFS",
+            version="2.0.0",
+            request="GetFeature",
+            typeNames=layer,
+            bbox=bbox,
+            resultType="hits",
+        )
+    )
+    return _count(_xml(body).get("numberMatched"))
+
+
 def _wfs_spatial_params(layer: dict[str, Any], bounds: tuple[float, ...]) -> tuple[str, str]:
     systems = layer.get("crs", [])
     for value in systems:
@@ -366,6 +382,9 @@ def download_source(
     if protocol == "wfs":
         selected = next(entry for entry in catalog["layers"] if entry["id"] == layer)
         wfs_crs, wfs_bbox = _wfs_spatial_params(selected, area.bounds)
+        wfs_total = _wfs_hits(reader, base, layer, wfs_bbox)
+        if wfs_total is not None and wfs_total > MAX_FEATURES:
+            raise ExternalDataError("Import exceeds 5,000 features. Select a smaller area.")
     item_url = base + "/collections/" + quote(layer, safe="") + "/items"
     if protocol == "ogc_features":
         metadata = reader.json(base + "/collections/" + quote(layer, safe=""))
@@ -380,7 +399,7 @@ def download_source(
     fetched = 0
     expected_matched = None
     imported_at = datetime.now(UTC).isoformat()
-    for _ in range(MAX_PAGES):
+    for page_number in range(MAX_PAGES):
         if protocol == "wfs":
             next_url = _query(
                 base,
@@ -391,7 +410,8 @@ def download_source(
                 srsName=wfs_crs,
                 bbox=wfs_bbox,
                 count=PAGE_SIZE,
-                startIndex=fetched,
+                # Pages can be short (PDOK drops a few); startIndex counts matches, not rows.
+                startIndex=page_number * PAGE_SIZE,
                 outputFormat=catalog["output_format"],
             )
         if next_url in seen_links:
@@ -478,7 +498,8 @@ def download_source(
                     "properties": properties,
                 }
             )
-        matched = _count(data.get("numberMatched"))
+        # WFS pages can't be trusted here (PDOK's is a running total); WFS uses wfs_total.
+        matched = _count(data.get("numberMatched")) if protocol == "ogc_features" else None
         if matched is not None:
             if expected_matched is not None and matched != expected_matched:
                 raise ExternalDataError(
@@ -490,8 +511,10 @@ def download_source(
                 "External result count changed during pagination. Retry the import."
             )
         if protocol == "wfs":
-            if not page or matched == fetched:
-                if matched is not None and fetched < matched:
+            if wfs_total is not None and (page_number + 1) * PAGE_SIZE >= wfs_total:
+                break
+            if not page:
+                if wfs_total is not None:
                     raise ExternalDataError(
                         "External service stopped before all matching features were fetched."
                     )
