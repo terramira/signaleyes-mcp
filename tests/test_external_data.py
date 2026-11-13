@@ -230,15 +230,35 @@ def test_wfs_rejects_layers_without_supported_geographic_crs():
         core._wfs_spatial_params({"crs": ["EPSG:28992"]}, (4, 52, 5, 53))
 
 
-def test_wfs_download_pages_with_pdok_axis_order_and_provenance(monkeypatch):
+WFS_CAPABILITIES = b"""<WFS_Capabilities version="2.0.0">
+  <FeatureTypeList><FeatureType><Name>demo:zones</Name>
+  <DefaultCRS>urn:ogc:def:crs:EPSG::4326</DefaultCRS>
+  <OutputFormats><Format>application/json</Format></OutputFormats>
+  </FeatureType></FeatureTypeList></WFS_Capabilities>"""
+
+
+def fake_wfs(monkeypatch, pages, hits):
+    """A WFS answering GetCapabilities, resultType=hits, and GeoJSON pages; returns page queries."""
     from urllib.parse import parse_qs, urlsplit
 
-    capabilities = b"""<WFS_Capabilities version="2.0.0">
-      <FeatureTypeList><FeatureType><Name>demo:zones</Name>
-      <DefaultCRS>urn:ogc:def:crs:EPSG::4326</DefaultCRS>
-      <OutputFormats><Format>application/json</Format></OutputFormats>
-      </FeatureType></FeatureTypeList></WFS_Capabilities>"""
     requests = []
+
+    class Reader:
+        def get(self, url):
+            if "resultType=hits" in url:
+                return f'<FeatureCollection numberMatched="{hits}"/>'.encode(), {}
+            return WFS_CAPABILITIES, {}
+
+        def json(self, url):
+            requests.append(parse_qs(urlsplit(url).query))
+            return pages.pop(0)
+
+    monkeypatch.setattr(core, "PublicReader", Reader)
+    return requests
+
+
+def test_wfs_download_pages_with_pdok_axis_order_and_provenance(monkeypatch):
+    monkeypatch.setattr(core, "PAGE_SIZE", 1)
     pages = [
         {
             "type": "FeatureCollection",
@@ -253,15 +273,7 @@ def test_wfs_download_pages_with_pdok_axis_order_and_provenance(monkeypatch):
         },
     ]
 
-    class Reader:
-        def get(self, url):
-            return capabilities, {}
-
-        def json(self, url):
-            requests.append(parse_qs(urlsplit(url).query))
-            return pages.pop(0)
-
-    monkeypatch.setattr(core, "PublicReader", Reader)
+    requests = fake_wfs(monkeypatch, pages, hits=2)
     result = core.download_source(BASE + "?service=WFS", "demo:zones", AREA)
     assert result["complete"] and result["feature_count"] == 2
     assert result["downloaded_count"] == 2
@@ -270,6 +282,43 @@ def test_wfs_download_pages_with_pdok_axis_order_and_provenance(monkeypatch):
     assert requests[0]["srsName"] == ["urn:ogc:def:crs:EPSG::4326"]
     assert result["geojson"]["features"][1]["properties"]["_external_feature_id"] == "two"
     assert [feature["id"] for feature in result["geojson"]["features"]] == ["one", "two"]
+
+
+def test_wfs_pages_past_pdok_short_pages_and_running_number_matched(monkeypatch):
+    # PDOK returns a few features fewer than `count` and reports numberMatched as a running
+    # total, so trusting either cut the Utrecht Binnenstad import off after its first page.
+    monkeypatch.setattr(core, "PAGE_SIZE", 3)
+    pages = [
+        {
+            "type": "FeatureCollection",
+            "numberMatched": "2",
+            "features": [feature(), feature(feature_id="b")],
+        },
+        {
+            "type": "FeatureCollection",
+            "numberMatched": "4",
+            "features": [feature(feature_id="c"), feature(feature_id="d")],
+        },
+    ]
+    requests = fake_wfs(monkeypatch, pages, hits=5)
+    result = core.download_source(BASE + "?service=WFS", "demo:zones", AREA)
+    assert [query["startIndex"] for query in requests] == [["0"], ["3"]]
+    assert result["downloaded_count"] == 4 and result["feature_count"] == 4
+
+
+def test_wfs_refuses_over_the_limit_before_downloading(monkeypatch):
+    monkeypatch.setattr(core, "MAX_FEATURES", 3)
+    requests = fake_wfs(monkeypatch, [], hits=12091)
+    with pytest.raises(core.ExternalDataError, match="5,000"):
+        core.download_source(BASE + "?service=WFS", "demo:zones", AREA)
+    assert requests == []
+
+
+def test_wfs_empty_page_before_the_total_is_incomplete(monkeypatch):
+    monkeypatch.setattr(core, "PAGE_SIZE", 1)
+    fake_wfs(monkeypatch, [{"type": "FeatureCollection", "features": []}], hits=2)
+    with pytest.raises(core.ExternalDataError, match="stopped"):
+        core.download_source(BASE + "?service=WFS", "demo:zones", AREA)
 
 
 def test_ogc_discovery_autodetects_json_and_reports_catalog_pagination():
