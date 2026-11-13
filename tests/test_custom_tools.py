@@ -863,3 +863,144 @@ def test_whoami_leaves_3d_wkt_without_a_bbox(
 
     out = _call(server, "whoami", {}).structured_content
     assert out["subscriptions"][0]["aoi"] == {"wkt_chars": len("POLYGON Z ((1 2 3, 4 5 6, 1 2 3))")}
+
+
+# --- stress-test findings ---------------------------------------------------
+
+
+def test_async_fetch_over_the_api_page_limit_fails_up_front(
+    mock_spec_get, spy_async_client, async_client_post_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_post_queue.responses.append(
+        _response(json={"id": "t1", "status": "running"}, headers={"X-Total-Pages": "90848"})
+    )
+
+    with pytest.raises(ToolError, match=r"90848 pages exceeds.*t1"):
+        _call(
+            server,
+            "post_large_polygon",
+            {"entity": "bag", "polygon": "POLYGON ((0 0))", "respond_async": True},
+        )
+
+
+def test_usage_summary_folds_ids_into_one_row_per_route(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+
+    def row(endpoint, when):
+        return {
+            "endpoint": endpoint,
+            "request_type": "UNKNOWN",
+            "total_area": "1.50 km2",
+            "number_of_objects": 2,
+            "number_of_requests": 1,
+            "last_activity": when,
+        }
+
+    async_client_get_queue.responses.append(
+        _response(
+            json={
+                "username": "u",
+                "requests": [
+                    row("/v1/task/" + "a" * 32 + "/describe", "2026-11-01"),
+                    row("/v1/task/" + "b" * 32 + "/describe", "2026-11-02"),
+                    row("/v1/source/water/8f845ec3-631f-4993-86b3-22f0bf57a949", "2026-11-03"),
+                ],
+            }
+        )
+    )
+
+    out = _call(server, "usage_summary", {}).structured_content
+
+    assert out["username"] == "u"
+    assert out["requests"][0] == {
+        "endpoint": "/v1/task/{id}/describe",
+        "request_type": "UNKNOWN",
+        "total_area_km2": 3.0,
+        "number_of_objects": 4,
+        "number_of_requests": 2,
+        "last_activity": "2026-11-02",
+    }
+    assert out["requests"][1]["endpoint"] == "/v1/source/water/{id}"
+
+
+def test_describe_drops_top_values_of_unique_columns(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(
+            json={
+                "building": {
+                    "number_of_features": 100,
+                    "attributes": ["id", "id_1", "roof_shape"],
+                    "categorical_summary": {
+                        "id": {"a": 1, "b": 1},
+                        "id_1": {"a": 3, "b": 2},
+                        "roof_shape": {"Plat": 60, "Hellend": 40},
+                    },
+                }
+            }
+        )
+    )
+
+    out = _call(server, "manage_task", {"task_id": "t1", "view": "describe"}).structured_content
+
+    assert out["building"]["categorical_summary"] == {"roof_shape": {"Plat": 60, "Hellend": 40}}
+    assert out["building"]["attributes"] == ["id", "id_1", "roof_shape"]
+
+
+def test_a_capped_result_is_a_three_feature_preview(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(
+            json={"type": "FeatureCollection", "features": [_big_feature(i) for i in range(50)]}
+        )
+    )
+
+    body = _call(server, "manage_task", {"task_id": "t1", "view": "result"}).structured_content
+
+    assert len(body["features"]) == 3
+    assert body["total_features"] == 50
+    assert "export_task_file" in body["hint"]
+
+
+def test_a_400_is_tagged_not_retryable(mock_spec_get, spy_async_client, async_client_get_queue):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.append(
+        _response(status_code=400, json={"detail": "Invalid polygon."})
+    )
+
+    with pytest.raises(ToolError, match=r"Invalid polygon.*Fix the arguments.*\[retryable=no\]$"):
+        _call(server, "fetch_all_pages", {"entity": "building", "polygon": "nope"})
+
+
+def test_get_objects_metadata_adds_attribute_names_from_the_default_aoi(
+    mock_spec_get, spy_async_client, async_client_get_queue
+):
+    server = _server(mock_spec_get, spy_async_client)
+    async_client_get_queue.responses.extend(
+        [
+            _response(json={"additionalAttributes": {"default_aoi": "POLYGON ((1 1))"}}),
+            _response(json={"features": [{"properties": {"street": "x", "area_m": 1}}]}),
+        ]
+    )
+
+    out = _call(server, "get_objects_metadata", {"entity": "agriparcel"}).structured_content
+
+    assert out["attributes"] == ["area_m", "street"]
+    assert async_client_get_queue.calls[1] == {
+        "url": "/source/agriparcel",
+        "params": {"polygon": "POLYGON ((1 1))", "page": 1},
+        "headers": None,
+    }
+
+
+def test_fetch_all_pages_rejects_max_pages_below_one(mock_spec_get, spy_async_client):
+    server = _server(mock_spec_get, spy_async_client)
+    with pytest.raises(Exception, match="greater than or equal to 1"):
+        _call(server, "fetch_all_pages", {"entity": "bag", "polygon": "P", "max_pages": 0})

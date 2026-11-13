@@ -1,5 +1,8 @@
 # signaleyes-mcp
 
+**Just want to use it with Claude Code, Cursor, Copilot or Codex?** Go to
+[Install for your coding agent](#install-for-your-coding-agent).
+
 MCP server for NEO's [SignalEyes API](https://api.neo.nl/v1/docs) (the API
 exposed by [SuperAPI](https://github.com/terramira/SuperAPI)) — a geospatial
 REST API combining building, tree, road, water, solar panel, and other
@@ -101,8 +104,13 @@ tools — one `GET .../{id}`, one `GET .../metadata`, and one
   broken setup fails with one clear tool call instead of dozens of opaque
   401s.
 
+- **`usage_summary`** — the API reports usage per literal path, so every
+  `/task/{id}/describe` call is its own row (760 rows / 160 KB for a month of
+  agent use). This folds task and record ids to `{id}`, sums per route, and
+  returns the 50 busiest rows.
+
 Everything else (the `/concept/*` and `/analyses/*` tools, `post_geojson`,
-`usage_summary`, `delete_task`) stays auto-generated — their parameters are
+`delete_task`) stays auto-generated — their parameters are
 genuinely different per operation, so collapsing them would trade a large
 tool count for a large, mostly-optional parameter list on a couple of tools,
 which is worse for an agent to reason about, not better.
@@ -116,7 +124,7 @@ the task — since knowing *which* tool exists is only half the problem an
 agent runs into here.
 
 The auto-generated tools that stay auto-generated (`concept_*`, `analyses_*`,
-`post_geojson`, `usage_summary`, `delete_task`) get short, stable names via
+`post_geojson`, `delete_task`) get short, stable names via
 `mcp_names` instead of FastMCP's default — the raw OpenAPI `operationId`,
 which for this API's FastAPI-generated spec repeats the function name and
 path (`get_task_concept_overlay_concept_overlay_get`). Every session that
@@ -225,47 +233,134 @@ uv run signaleyes-mcp smoke --entity tree --polygon "POLYGON ((...))"
 `smoke` needs `SIGNALEYES_USERNAME`/`PASSWORD` set (it hits the live API).
 The test suite is `uv run pytest` (everything but `test_live_spec.py` is mocked).
 
-## Register with an MCP client
+## Install for your coding agent
 
-**Claude Code:**
+Everyone runs the server on their own machine with their own SignalEyes
+login. Nothing is hosted: your agent starts the server as a local process
+when it needs it, and the server talks to the SignalEyes API directly. Your
+tasks and usage stay on your account.
+
+You do this once per machine. It takes about five minutes.
+
+### 1. Prerequisites
+
+- **uv** — <https://docs.astral.sh/uv/getting-started/installation/>
+- **Access to this repo** — it is private, so `git` must be able to clone it.
+  `gh auth login` (GitHub CLI) is the quickest way.
+- **A SignalEyes API account** — your own username and password. Ask NEO if
+  you don't have one. Don't share a login: anyone on the same account can
+  read and delete each other's tasks.
+
+### 2. Save your credentials once
+
+Create `~/.signaleyes-mcp.env` (Windows: `%USERPROFILE%\.signaleyes-mcp.env`):
 
 ```bash
-claude mcp add signaleyes-mcp \
-  --env SIGNALEYES_USERNAME=your_username \
-  --env SIGNALEYES_PASSWORD=your_password \
-  -- uv run --directory /path/to/signaleyes-mcp signaleyes-mcp
+SIGNALEYES_USERNAME=your_username
+SIGNALEYES_PASSWORD=your_password
 ```
 
-Also copy `.claude/skills/signaleyes-mcp/` from this repo into your own
-project's `.claude/skills/` if you're using Claude Code. Tool schemas
-cover what each tool takes; the skill covers what they don't — the async
-`task_id` pattern almost every real call goes through, and reusable
-fetch → buffer → overlay/sjoin patterns for compound questions like "what's
-within N meters of X". A well-documented MCP server and a skill aren't
-either/or: MCP gives an agent *access*, a skill gives it *judgment* about
-how to use that access well — see [Anthropic's Agent Skills
-writeup](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
-for the general case. An unused skill costs only its `name`/`description`
-in context (~100 tokens) until Claude decides it's relevant, so adding one
-alongside a lean tool set — rather than instead of one — is the cheap
-option, not the expensive one.
+```bash
+chmod 600 ~/.signaleyes-mcp.env   # macOS/Linux: readable by you only
+```
 
-**GitHub Copilot CLI** — add to `~/.copilot/mcp-config.json`:
+Every agent below reads this file through the server, so the password is in
+one place and not copied into four config files.
+
+### 3. Check it works
+
+```bash
+uvx --from git+https://github.com/terramira/signaleyes-mcp signaleyes-mcp smoke
+```
+
+This should print `Credentials OK` and a feature count. If it does, the
+server itself is fine and any later problem is in the agent's config.
+
+### 4. Add it to your agent(s)
+
+The server command is the same everywhere:
+
+```
+uvx --from git+https://github.com/terramira/signaleyes-mcp signaleyes-mcp
+```
+
+Add it to each agent you use, then restart that agent.
+
+**Claude Code**
+
+```bash
+claude mcp add --scope user signaleyes-mcp -- \
+  uvx --from git+https://github.com/terramira/signaleyes-mcp signaleyes-mcp
+```
+
+**Codex**
+
+```bash
+codex mcp add signaleyes-mcp -- \
+  uvx --from git+https://github.com/terramira/signaleyes-mcp signaleyes-mcp
+```
+
+or in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.signaleyes-mcp]
+command = "uvx"
+args = ["--from", "git+https://github.com/terramira/signaleyes-mcp", "signaleyes-mcp"]
+```
+
+**Cursor** — `~/.cursor/mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "signaleyes-mcp": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/signaleyes-mcp", "signaleyes-mcp"],
-      "env": {
-        "SIGNALEYES_USERNAME": "your_username",
-        "SIGNALEYES_PASSWORD": "your_password"
-      }
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/terramira/signaleyes-mcp", "signaleyes-mcp"]
     }
   }
 }
 ```
+
+**GitHub Copilot CLI** — `~/.copilot/mcp-config.json`: the same JSON as
+Cursor.
+
+**GitHub Copilot in VS Code** — run **MCP: Open User Configuration** and add
+the same entry, but under a top-level `"servers"` key instead of
+`"mcpServers"`.
+
+### 5. Try it
+
+Ask the agent: *"Use signaleyes to count the buildings around Utrecht
+Centraal."* It should call `whoami` or `list_source_entities`, then
+`fetch_all_pages`.
+
+The server tells every agent how to use the API (the task pattern, how to
+chain concepts) through its built-in instructions and the
+`skill://signaleyes/SKILL.md` resource, so there is nothing else to install.
+Claude Code users can optionally copy `.claude/skills/signaleyes-mcp/` into
+a project's `.claude/skills/` for the longer worked examples.
+
+### Updating
+
+`uvx` caches the build. To pick up a new version:
+
+```bash
+uvx --refresh --from git+https://github.com/terramira/signaleyes-mcp signaleyes-mcp smoke
+```
+
+then restart your agent. To stay on a fixed version, add a tag to the URL in
+your config: `git+https://github.com/terramira/signaleyes-mcp@v0.1.0`.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `SIGNALEYES_USERNAME and SIGNALEYES_PASSWORD must be set` | `~/.signaleyes-mcp.env` is missing or misnamed. Re-do step 2. |
+| 401 or 403 on every call | Wrong credentials, or the area is outside your subscription. Ask the agent to run `whoami`. |
+| `uvx` fails with a git or authentication error | Your machine can't clone the private repo. Run `gh auth login`. |
+| Agent shows no SignalEyes tools | The agent wasn't restarted, or `uvx` isn't on the PATH the agent sees. Use the full path from `which uvx` as the command. |
+| Server takes a while on first start | First run builds the package and downloads the API spec. Later starts are fast. |
 
 ## Orchestrator / multi-agent use
 
@@ -320,12 +415,15 @@ parses that tag instead of keeping its own table.
 
 A FeatureCollection over `SIGNALEYES_MAX_TOOL_RESPONSE_BYTES` (default
 50_000 — above that Claude Code moves the result to a file the model
-never sees inline) is trimmed to whole leading features and marked
-`truncated: true` / `total_features`, so it stays valid JSON;
+never sees inline) is cut to a 3-feature preview and marked
+`truncated: true` / `total_features` (a partial list of geometries is not
+usable data; `export_task_file` is the way to get all of it);
 `fetch_all_pages` also stops paging once past the cap (and marks an early
 stop `truncated` without claiming a total). For counts/stats use
 `respond_async=True` then `manage_task(view="describe")` instead of pulling
-geometries.
+geometries. `describe` output drops the top-value lists of
+(near-)unique columns such as ids. An async fetch the API will later fail
+for exceeding its 500-page limit is rejected up front.
 
 Retries live in `client.RetryingClient.send` (not a custom transport, so
 httpx keeps `HTTP(S)_PROXY`/`NO_PROXY` support): 429 always, connect

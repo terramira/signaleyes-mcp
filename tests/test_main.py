@@ -119,7 +119,9 @@ def test_serve_calls_load_dotenv_before_checking_credentials(clean_env, monkeypa
 
     signaleyes_mcp.main([])
 
-    fake_load_dotenv.assert_called_once_with()
+    # The cwd .env first, then the per-user file every MCP client shares.
+    assert fake_load_dotenv.call_args_list[0].args == ()
+    assert fake_load_dotenv.call_args_list[1].args[0].name == ".signaleyes-mcp.env"
 
 
 def test_env_file_fills_in_credentials_missing_from_the_environment(clean_env, monkeypatch):
