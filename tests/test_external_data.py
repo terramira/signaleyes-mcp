@@ -269,6 +269,7 @@ def test_wfs_download_pages_with_pdok_axis_order_and_provenance(monkeypatch):
     assert requests[0]["bbox"] == ["52.0,4.0,53.0,5.0,urn:ogc:def:crs:EPSG::4326"]
     assert requests[0]["srsName"] == ["urn:ogc:def:crs:EPSG::4326"]
     assert result["geojson"]["features"][1]["properties"]["_external_feature_id"] == "two"
+    assert [feature["id"] for feature in result["geojson"]["features"]] == ["one", "two"]
 
 
 def test_ogc_discovery_autodetects_json_and_reports_catalog_pagination():
